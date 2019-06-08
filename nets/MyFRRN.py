@@ -94,7 +94,6 @@ class SegTailBlock(nn.Module):
 		return self.conv(input)
 
 
-
 class DownBlock(nn.Module):
 	def __init__(self, in_channel, out_channel, act=True):
 		super(DownBlock, self).__init__()
@@ -130,7 +129,7 @@ class MyFRRN(nn.Module):
 	def __init__(self, args=None):
 		super(MyFRRN, self).__init__()
 		self.n_classes = 20 
-		self.seg_encode_dim = 1
+		self.seg_encode_dim = 4
 		self.args=args
 		if self.args.mode == 'xs2xs':
 			self.in_channel = (3+self.seg_encode_dim)*2
@@ -209,7 +208,7 @@ class MyFRRN(nn.Module):
 		if self.args.runner == 'gen':
 			return output_rgb, output_seg
 		else:
-			return output_rgb,  output_seg, self.seg_encoder(gt[:,3:])
+			return output_rgb,  output_seg, None
 
 
 

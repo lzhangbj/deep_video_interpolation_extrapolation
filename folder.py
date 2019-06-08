@@ -82,25 +82,38 @@ class DatasetFolder(data.Dataset):
         self.seg_ext = "_gtFine_myseg_id.png"
         self.edge_dir = "/data/linz/proj/Dataset/Cityscape/leftImg_sequence/edges256/"
         self.edge_ext = "_edge.png"
+        self.disparity_dir = '/data/linz/proj/Dataset/Cityscape/disparity_sequence/'
+        self.disparity_ext = '_disparity.png'
         self.n_classes = 20
         self.vid_len = len(self.root[0])
 
     def __getitem__(self, index):
         img_files = [self.img_dir+self.root[index][i]+self.img_ext for i in range(self.vid_len)]
         seg_files = [self.seg_dir+self.root[index][i]+self.seg_ext for i in range(self.vid_len)]
+        disparity_files = [self.disparity_dir+self.root[index][i]+self.disparity_ext for i in range(self.vid_len)]
 
         ori_imgs = rgb_load(img_files)
         seg_imgs = seg_load(seg_files)
         edge = pil_loader_seg(self.edge_dir+self.root[index][1]+self.edge_ext)
+        disparity_imgs = [pil_loader_seg(disparity_files[i]) for i in range(self.vid_len)]
         seg_imgs_ori = []
 
+        seg_fg_masks = []
+        seg_bg_masks = []
+
         for i in range(self.vid_len):
-            ori_imgs[i] = transforms.functional.normalize(
-                                transforms.functional.to_tensor(
+            # ori_imgs[i] = transforms.functional.normalize( 
+            ori_imgs[i] = transforms.functional.to_tensor(
                                     self.transform(ori_imgs[i], i==0)
-                                    ),  (0.5, 0.5, 0.5),(0.5, 0.5, 0.5)
-                                )
+                                )#,  (0.5, 0.5, 0.5),(0.5, 0.5, 0.5)
+                                # )
             np_seg = np.array(self.transform(seg_imgs[i]))
+            fg_mask = np.logical_and(np_seg >= 11, np_seg <= 18)[np.newaxis, :, :].astype(np.float32)
+            bg_mask = 1-fg_mask
+
+            seg_fg_masks.append(torch.from_numpy(fg_mask).float())
+            seg_bg_masks.append(torch.from_numpy(bg_mask).float())
+
             # np_seg_ori = np_seg[:, :, np.newaxis]
             # seg_imgs_ori.append(torch.from_numpy(
             #                             np.transpose(
@@ -112,20 +125,35 @@ class DatasetFolder(data.Dataset):
                                         np.transpose(
                                             np_seg, (2,0,1)
                                             )
-                                        ).float() * 2 - 1
+                                        ).float()  #* 2 - 1
+            disparity_imgs[i] = torch.from_numpy(
+                                        np.array(self.transform(disparity_imgs[i]))[np.newaxis, :, :]
+                                    ).float()
 
-        t = np.array(self.transform(edge))[np.newaxis, :, :]/255.
+
+        # t = np.array(self.transform(edge))[np.newaxis, :, :]/255.
         # print(t.shape)
-        edge = torch.from_numpy(t).float()
+        # edge = torch.from_numpy(t).float()
 
         self.transform.derecord()
-        return {'frame1':ori_imgs[0],
-                'frame2':ori_imgs[1],
-                'frame3':ori_imgs[2],
-                'seg1'  :seg_imgs[0],
-                'seg2'  :seg_imgs[1],
-                'seg3'  :seg_imgs[2],
-                'edge'  :edge}            
+
+        frames = torch.stack(ori_imgs, dim=0)
+        segs = torch.stack(seg_imgs, dim=0)
+        disparities = torch.stack(disparity_imgs, dim=0) 
+        fg_masks = torch.stack(seg_fg_masks, dim=0)
+        bg_masks = torch.stack(seg_bg_masks, dim=0)
+        return {'frames':frames,
+                'segs': segs,
+                'disparities': disparities,
+                'fg_masks': fg_masks,
+                'bg_masks': bg_masks}
+        # return {'frame1':ori_imgs[0],
+        #         'frame2':ori_imgs[1],
+        #         'frame3':ori_imgs[2],
+        #         'seg1'  :seg_imgs[0],
+        #         'seg2'  :seg_imgs[1],
+        #         'seg3'  :seg_imgs[2],
+        #         'edge'  :edge}            
                 # 'seg_id1'  :seg_imgs_ori[0],
                 # 'seg_id2'  :seg_imgs_ori[1],
                 # 'seg_id3'  :seg_imgs_ori[2]}

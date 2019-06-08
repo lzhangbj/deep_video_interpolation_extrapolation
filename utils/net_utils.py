@@ -6,7 +6,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.utils import make_grid
 from utils.data_utils import *
+from torch.autograd import Variable as Vb
 
+def preprocess_norm(input_tensor, cuda=True):
+	'''
+
+	'''
+	mean_arr = torch.tensor([-0.03,-0.088,-0.188])[None,:,None,None]
+	std_arr = torch.tensor([0.458,0.448,0.450])[None,:,None,None]
+	if cuda:
+		device = input_tensor.get_device()
+		mean_arr = mean_arr.cuda(device)
+		std_arr = std_arr.cuda(device)
+	return (input_tensor-mean_arr)/std_arr
 
 def weights_init(m):
 	classname = m.__class__.__name__
@@ -16,7 +28,23 @@ def weights_init(m):
 		m.weight.data.normal_(1.0, 0.02)
 		m.bias.data.fill_(0)
 
+def transform_seg_one_hot(seg, n_cls, cuda=False):
+	'''
+		input tensor:
+			seg  (bs, h, w) Long Tensors
+			seg  (bs, vid, h, w)
+		output tensor
+			seg_one_hot  (bs, n_cls, h, w) float tensor
+			seg_one_hot  (bs, vid, n_cls, h, w) float tensor
 
+	'''
+	if len(seg.size()) == 3:
+		seg_one_hot = torch.eye(n_cls)[seg.long()].permute(0,3,1,2).contiguous().float()#.cuda().float()#seg.get_device())
+	else:
+		raise Exception("shape wrong ", seg_one_hot.size())
+	if cuda:
+		seg_one_hot = seg_one_hot.float().cuda(seg.get_device())
+	return seg_one_hot
 
 def vis_seg_mask(seg, n_classes, seg_id=False):
 	'''
@@ -49,3 +77,164 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+class FlowWrapper(nn.Module):
+    def __init__(self):
+        super(FlowWrapper, self).__init__()
+
+    def forward(self, x, flow):
+        # flow: (batch size, 2, height, width)
+        # x = x.cuda()
+        N = x.size()[0]
+        H = x.size()[2]
+        W = x.size()[3]
+        base_grid = torch.zeros([N, H, W, 2])
+        linear_points = torch.linspace(-1, 1, W) if W > 1 else torch.Tensor([-1])
+        base_grid[:, :, :, 0] = torch.ger(torch.ones(H), linear_points).expand_as(base_grid[:, :, :, 0])
+        linear_points = torch.linspace(-1, 1, H) if H > 1 else torch.Tensor([-1])
+        base_grid[:, :, :, 1] = torch.ger(linear_points, torch.ones(W)).expand_as(base_grid[:, :, :, 1])
+        if x.is_cuda:
+            base_grid = Vb(base_grid).cuda()
+        else:
+            base_grid = Vb(base_grid)
+        # print flow.shape
+        flow = flow.transpose(1, 2).transpose(2, 3)
+        # print flow.size()
+        grid = base_grid - flow
+        # print grid.size()
+        out = F.grid_sample(x, grid)
+        return out
+
+def warp(frame, flow, opt, flowwarpper, mask):
+    '''Use mask before warpping'''
+    out = [torch.unsqueeze(flowwarpper(frame, flow[:, :, i, :, :] * mask[:, i:i + 1, ...]), 1)
+           for i in range(opt.vid_length)]
+    output = torch.cat(out, 1)  # (64, 4, 3, 128, 128)
+    return output
+
+
+def warp_back(frame, flowback, opt, flowwarpper, mask):
+    prevframe = [
+        torch.unsqueeze(flowwarpper(frame[:, ii, :, :, :], -flowback[:, :, ii, :, :] * mask[:, ii:ii + 1, ...]), 1)
+        for ii in range(opt.vid_length)]
+    output = torch.cat(prevframe, 1)
+    return output
+
+
+def refine(input, flow, mask, refine_net, opt, noise_bg):
+    '''Go through the refine network.'''
+    # apply mask to the warpped image
+    bs, _, _, h, w = input.size()
+    if opt.seg:
+        noise_seg = noise_bg.new(bs, 20, h, w).fill_(0)
+        noise = torch.cat([noise_bg, noise_seg], dim=1)
+    else:
+        noise = noise_bg
+    out = [torch.unsqueeze(refine_net(input[:, i, ...] * mask[:, i:i + 1, ...] 
+                                        + noise * (1. - mask[:, i:i + 1, ...])
+                                           , flow[:, :, i, :, :]
+                                      ), 1) for i in range(opt.vid_length)]
+
+    out = torch.cat(out, 1)
+    return out
+
+def make_color_wheel():
+    """
+    Generate color wheel according Middlebury color code
+    :return: Color wheel
+    """
+    RY = 15
+    YG = 6
+    GC = 4
+    CB = 11
+    BM = 13
+    MR = 6
+
+    ncols = RY + YG + GC + CB + BM + MR
+
+    colorwheel = np.zeros([ncols, 3])
+
+    col = 0
+
+    # RY
+    colorwheel[0:RY, 0] = 255
+    colorwheel[0:RY, 1] = np.transpose(np.floor(255 * np.arange(0, RY) / RY))
+    col += RY
+
+    # YG
+    colorwheel[col:col + YG, 0] = 255 - np.transpose(np.floor(255 * np.arange(0, YG) / YG))
+    colorwheel[col:col + YG, 1] = 255
+    col += YG
+
+    # GC
+    colorwheel[col:col + GC, 1] = 255
+    colorwheel[col:col + GC, 2] = np.transpose(np.floor(255 * np.arange(0, GC) / GC))
+    col += GC
+
+    # CB
+    colorwheel[col:col + CB, 1] = 255 - np.transpose(np.floor(255 * np.arange(0, CB) / CB))
+    colorwheel[col:col + CB, 2] = 255
+    col += CB
+
+    # BM
+    colorwheel[col:col + BM, 2] = 255
+    colorwheel[col:col + BM, 0] = np.transpose(np.floor(255 * np.arange(0, BM) / BM))
+    col += + BM
+
+    # MR
+    colorwheel[col:col + MR, 2] = 255 - np.transpose(np.floor(255 * np.arange(0, MR) / MR))
+    colorwheel[col:col + MR, 0] = 255
+
+    return colorwheel
+
+
+
+def compute_color(u, v):
+    """
+    compute optical flow color map
+    :param u: optical flow horizontal map
+    :param v: optical flow vertical map
+    :return: optical flow in color code
+    """
+    [h, w] = u.shape
+    img = np.zeros([h, w, 3])
+    nanIdx = np.isnan(u) | np.isnan(v)
+    u[nanIdx] = 0
+    v[nanIdx] = 0
+
+    colorwheel = make_color_wheel()
+    ncols = np.size(colorwheel, 0)
+
+    rad = np.sqrt(u ** 2 + v ** 2)
+
+    a = np.arctan2(-v, -u) / np.pi
+
+    fk = (a + 1) / 2 * (ncols - 1) + 1
+
+    k0 = np.floor(fk).astype(int)
+
+    k1 = k0 + 1
+    k1[k1 == ncols + 1] = 1
+    f = fk - k0
+
+    for i in range(0, np.size(colorwheel, 1)):
+        tmp = colorwheel[:, i]
+        col0 = tmp[k0 - 1] / 255
+        col1 = tmp[k1 - 1] / 255
+        col = (1 - f) * col0 + f * col1
+
+        idx = rad <= 1
+        col[idx] = 1 - rad[idx] * (1 - col[idx])
+        notidx = np.logical_not(idx)
+
+        col[notidx] *= 0.75
+        img[:, :, i] = np.uint8(np.floor(255 * col * (1 - nanIdx)))
+
+    return img
+
+def gradientx(img):
+    return img[:, :, :, :-1] - img[:, :, :, 1:]
+
+
+def gradienty(img):
+    return img[:, :, :-1, :] - img[:, :, 1:, :]

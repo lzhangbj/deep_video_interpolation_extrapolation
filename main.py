@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 import numpy as np 
 
 from runners.trainer import Trainer
-
+from runners.VAEer import VAEer
 from runners.ganer import GANer
 from options.gan_options import GANOptions
 from options.generator_options import GenOptions
@@ -76,6 +76,8 @@ def worker(rank, args):
 		trainer = Trainer(args)
 	elif args.runner =='gan':
 		trainer = GANer(args)
+	elif args.runner == 'vae':
+		trainer = VAEer(args)
 	else:
 		raise Exception("speficied runner does not exist !")
 
@@ -103,7 +105,7 @@ def main():
 	
 	# exp path
 	args.path = get_exp_path(args)
-	if args.resume or args.val or args.load_G:
+	if args.resume or args.val or ( args.runner == 'gan' and args.load_G):
 		args.path = args.load_dir
 	else:
 		pathlib.Path(args.path).mkdir(parents=True, exist_ok=False)

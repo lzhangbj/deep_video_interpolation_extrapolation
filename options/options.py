@@ -31,6 +31,10 @@ class Options():
 												help='synthesize method',
 												choices=['inter', 'extra'],
 												default='extra') 
+		self.parser.add_argument('--vid_len', dest='vid_length', 
+												type=int,
+												default=8, 
+												help='Batch size (over multiple gpu)')
 		self.parser.add_argument('--mode', dest='mode',
 												help='mode to use',
 												choices=['xs2xs', 'xss2x', 'edge'],
@@ -49,11 +53,15 @@ class Options():
 		self.parser.add_argument('--l1_w', dest='l1_weight',
 												help='training optimizer loss weigh of l1',
 												type=float,
-												default=20)
+												default=80)
+		self.parser.add_argument('--sharp_w', dest='sharp_weight',
+												help='training optimizer loss weigh of feat',
+												type=float,
+												default=20) 
 		self.parser.add_argument('--gdl_w', dest='gdl_weight',
 												help='training optimizer loss weigh of gdl',
 												type=float,
-												default=20)
+												default=0)
 		self.parser.add_argument('--vgg_w', dest='vgg_weight',
 												help='training optimizer loss weigh of vgg',
 												type=float,
@@ -61,16 +69,16 @@ class Options():
 		self.parser.add_argument('--ce_w', dest='ce_weight',
 												help='training optimizer loss weigh of vgg',
 												type=float,
-												default=10)     
+												default=30)     
 		self.parser.add_argument('--ssim_w', dest='ssim_weight',
 												help='training optimizer loss weigh of feat',
 												type=float,
-												default=20)     
+												default=20)       
 		self.parser.add_argument('--interval', dest='interval',
 												help='training optimizer loss weigh of feat',
 												type=int,
-												choices=[1,2],
-												default=2) 		
+												choices=[1,2,3,4,5],
+												default=1)      
 
 
 
@@ -123,7 +131,7 @@ class Options():
 												action='store_true')
 		self.parser.add_argument('--checkepoch_low', dest='checkepoch_low',
 												help='checkepoch to load model',
-												default=1, type=int)	
+												default=1, type=int)    
 		self.parser.add_argument('--checkepoch_up', dest='checkepoch_up',
 												help='checkepoch to load model',
 												default=20, type=int)
@@ -205,6 +213,39 @@ class Options():
 		gan_parser.add_argument('--load_GANG', dest='load_GANG',
 										help='training optimizer loss weigh of gdl',
 										action='store_true')
+
+
+		# only generator mode
+		vae_parser = subparsers.add_parser('vae', help='use generator')
+		vae_parser.add_argument('--model', dest='model', 
+										default='VAE', 
+										help='model to use',
+										choices=['GridNet', 'MyFRRN', 'VAE','VAE_S'])  
+		vae_parser.add_argument('--o', dest='optimizer', 
+										help='training optimizer',
+										choices =['adamax','adam', 'sgd'], 
+										default="adamax")
+		vae_parser.add_argument('--learning_rate', dest='learning_rate', 
+										help='starting learning rate',
+										default=0.001, type=float)
+		vae_parser.add_argument('--input_size',
+										default=(128, 128),
+										type=tuple,
+										help='input image size')
+		vae_parser.add_argument('--latent_dim',
+										default=512,
+										type=int,
+										help='input image size')
+		vae_parser.add_argument('--seg_dim',
+										default=4,
+										type=int,
+										help='input image size')
+		vae_parser.add_argument('--seg',
+										action='store_true',
+										help='input image size')
+		vae_parser.add_argument('--disparity',
+										action='store_true',
+										help='input image size')
 		self.initialized = True
 
 

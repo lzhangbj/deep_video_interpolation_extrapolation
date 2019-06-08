@@ -18,11 +18,11 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets 
 from tensorboardX import SummaryWriter 
 from torchvision.utils import make_grid
-from losses import RGBLoss, PSNR, SSIM, IoU, GANLoss, GANMapLoss
+from losses import RGBLoss, PSNR, SSIM, IoU, GANLoss, GANMapLoss, VGGCosineLoss
 import nets
 
 from data import get_dataset
-from utils.net_utils import AverageMeter, vis_seg_mask
+from utils.net_utils import *
 
 
 def get_model(args):
@@ -74,6 +74,7 @@ class GANer:
             self.PSNRLoss = PSNR().cuda(args.rank)
             self.SSIMLoss = SSIM().cuda(args.rank)
             self.IoULoss = IoU().cuda(args.rank)
+            self.VGGCosLoss = VGGCosineLoss().cuda(args.rank)
 
             val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
 
@@ -166,36 +167,77 @@ class GANer:
         return heatmap
 
 
-    def prepare_image_set(self, data, img, seg, pred_fake, pred_real, label_map, gen_prob=None, diff_map=None):
+    def prepare_image_set(self, data, img, seg, pred_fake, pred_real, label_map, gen_prob=None, diff_map=None, extra=False):
+        # print(pred_real[0][-1].size())
         view_rgbs = [   self.normalize(data['frame1'][0]), 
                         self.normalize(data['frame2'][0]), 
                         self.normalize(data['frame3'][0])   ]
         view_segs = [vis_seg_mask(data['seg'+str(i)][0].unsqueeze(0), 20).squeeze(0) for i in range(1, 4)]
 
-        pred_rgb = self.normalize(img[0].cpu())
-        pred_seg = vis_seg_mask(seg[0].cpu().unsqueeze(0), 20).squeeze(0) if self.args.mode in ['xs2xs', 'edge'] else torch.zeros_like(view_segs[0])
-        insert_index = 2 if self.args.syn_type == 'inter' else 3
-        
-        view_rgbs.insert(insert_index, pred_rgb)
-        view_segs.insert(insert_index, pred_seg)
 
-        view_probs_gt = []
-        for i in range(self.args.num_D):
-            toDraw = F.interpolate(pred_real[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
-            view_probs_gt.append(self.create_heatmap(toDraw))
-        view_probs_gt.append(self.heatmap)
-        if diff_map is not None:
-            view_probs_gt.append(self.create_heatmap(diff_map[0].cpu()))
+        if not extra:
+            pred_rgb = self.normalize(img[0].cpu())
+            pred_seg = vis_seg_mask(seg[0].cpu().unsqueeze(0), 20).squeeze(0) if self.args.mode in ['xs2xs', 'edge'] else torch.zeros_like(view_segs[0])
+            insert_index = 2 if self.args.syn_type == 'inter' else 3
+            
+            view_rgbs.insert(insert_index, pred_rgb)
+            view_segs.insert(insert_index, pred_seg)
 
-        view_probs_fk = []
-        for i in range(self.args.num_D):
-            toDraw = F.interpolate(pred_fake[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
-            view_probs_fk.append(self.create_heatmap(toDraw))
-        view_probs_fk.append(self.create_heatmap(F.interpolate(label_map[0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)))
-        if gen_prob is not None:
-            view_probs_fk.append(self.create_heatmap(gen_prob[0].cpu()))
+            view_probs_gt = []
+            for i in range(self.args.num_D):
+                toDraw = F.interpolate(pred_real[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
+                view_probs_gt.append(self.create_heatmap(toDraw))
+            view_probs_gt.append(self.heatmap)
+            view_probs_gt.append(torch.zeros_like(self.heatmap))
 
-        write_in_img = make_grid(view_rgbs + view_segs + view_probs_gt + view_probs_fk, nrow=4)
+            if diff_map is not None:
+                view_probs_gt.append(self.create_heatmap(diff_map[0].cpu()))
+
+            view_probs_fk = []
+            for i in range(self.args.num_D):
+                toDraw = F.interpolate(pred_fake[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
+                view_probs_fk.append(self.create_heatmap(toDraw))
+            view_probs_fk.append(self.create_heatmap(F.interpolate(label_map[0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)))
+            if gen_prob is not None:
+                view_probs_fk.append(self.create_heatmap(gen_prob[0].cpu()))
+            write_in_img = make_grid(view_rgbs + view_segs + view_probs_gt + view_probs_fk, nrow=4)
+        else:
+            pred_rgb = self.normalize(img[0][0].cpu())
+            pred_seg = vis_seg_mask(seg[0][0].cpu().unsqueeze(0), 20).squeeze(0) if self.args.mode in ['xs2xs', 'edge'] else torch.zeros_like(view_segs[0])
+            insert_index = 2 if self.args.syn_type == 'inter' else 3
+            
+            view_rgbs.insert(insert_index, pred_rgb)
+            view_segs.insert(insert_index, pred_seg)
+
+            view_probs_gt = []
+            for i in range(self.args.num_D):
+                toDraw = F.interpolate(pred_real[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
+                view_probs_gt.append(self.create_heatmap(toDraw))
+            view_probs_gt.append(self.heatmap)
+            view_probs_gt.append(torch.zeros_like(self.heatmap))
+
+            if diff_map is not None:
+                view_probs_gt.append(self.create_heatmap(diff_map[0].cpu()))
+
+            view_probs_fk = []
+            for i in range(self.args.num_D):
+                toDraw = F.interpolate(pred_fake[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
+                view_probs_fk.append(self.create_heatmap(toDraw))
+            view_probs_fk.append(self.create_heatmap(F.interpolate(label_map[0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)))
+            if gen_prob is not None:
+                view_probs_fk.append(self.create_heatmap(gen_prob[0].cpu()))      
+
+            # extra images
+            view_pred_rgbs = []
+            view_pred_segs = []
+            for i in range(self.args.extra_length):
+                pred_rgb = self.normalize(img[i][0].cpu())
+                pred_seg = vis_seg_mask(seg[i].cpu(), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
+                view_pred_rgbs.append(pred_rgb)
+                view_pred_segs.append(pred_seg)      
+
+            write_in_img = make_grid(view_rgbs + view_segs + view_probs_gt + view_probs_fk + view_pred_rgbs + view_pred_segs, nrow=4) 
+
         return write_in_img
 
     def GAN_feat_loss(self, pred_fake, pred_real):
@@ -242,7 +284,7 @@ class GANer:
             img, seg, pred_fake_D, pred_real_D, pred_fake_G, label_map = self.model(x, gt)
             # diff_map = self.create_diff_map(img, gt[:,:3])
             if not self.args.load_G :#and not ( self.epoch == 1 and self.step % 50 != 0 ) :
-                loss_dict = self.RGBLoss(img, gt[:, :3])
+                loss_dict = self.RGBLoss(img, gt[:, :3], False)
                 if self.args.mode in ['xs2xs', 'edge']:
                    loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(seg, torch.argmax(gt[:,3:], dim=1))
 
@@ -330,7 +372,8 @@ class GANer:
             'l1': AverageMeter(),
             'psnr':AverageMeter(),
             'ssim':AverageMeter(),
-            'iou':AverageMeter()
+            'iou':AverageMeter(),
+            'vgg':AverageMeter()
         }
         for i in range(self.args.num_D):
             val_criteria['fake_mean_'+str(i)] = AverageMeter()
@@ -363,6 +406,7 @@ class GANer:
                 step_losses['psnr'] = self.PSNRLoss((img+1)/2, (gt[:,:3]+1)/2)
                 step_losses['ssim'] = 1-self.SSIMLoss(img, gt[:,:3])
                 step_losses['iou'] =  self.IoULoss(torch.argmax(seg, dim=1), torch.argmax(gt[:,3:], dim=1))
+                step_losses['vgg'] =  self.VGGCosLoss(img, gt[:, :3], False)
 
                 for i in range(self.args.num_D):
                     step_losses['real_mean_'+str(i)] =  torch.mean(real_probs[:, i])
@@ -370,6 +414,21 @@ class GANer:
                 self.sync(step_losses) # sum
                 for key in list(val_criteria.keys()):
                     val_criteria[key].update(step_losses[key].cpu().item(), size*self.args.gpus)
+
+                if self.args.syn_type == 'extra':
+                    imgs = []
+                    segs = []
+                    img = img[0].unsqueeze(0)
+                    seg = seg[0].unsqueeze(0)
+                    x = x[0].unsqueeze(0)
+                    for i in range(self.args.extra_length):
+                        if i!=0:
+                            x = torch.cat([x[:,3:6], img, x[:, 26:46], seg_fil], dim=1).cuda(self.args.rank, non_blocking=True)
+                            img, seg, _, _, _, _ = self.model(x)
+                        seg_fil = torch.argmax(seg, dim=1)
+                        seg_fil = transform_seg_one_hot(seg_fil, 20, cuda=True)*2-1
+                        imgs.append(img)
+                        segs.append(seg_fil)
 
                 # save validate result
                 # p = torch.cat([frame1.cuda(), frame_middle, frame2.cuda(), img], dim=1)
@@ -392,7 +451,10 @@ class GANer:
                         comp_time = 0
                         load_time = 0
                     if self.step % 3 == 0:
-                        image_set = self.prepare_image_set(data, img, seg, pred_fake, pred_real, label_map)
+                        if self.args.syn_type == 'inter':
+                            image_set = self.prepare_image_set(data, img, seg, pred_fake, pred_real, label_map)
+                        else:
+                            image_set = self.prepare_image_set(data, imgs, segs, pred_fake, pred_real, label_map, extra=True)
                         image_name = 'e{}_img_{}'.format(self.epoch, self.step)
                         # for i in range(self.args.num_D):
                         #     image_name += '_f{:.3f}_r{:.3f}'.format(fake_probs[0,i].item(), real_probs[0,i].cpu().item())
@@ -404,12 +466,14 @@ class GANer:
                 L1\t: {l1:.4f}     \n\
                 PSNR\t: {psnr:.4f}   \n\
                 SSIM\t: {ssim:.4f}   \n\
-                IoU\t: {iou:.4f}    \n'.format(
+                IoU\t: {iou:.4f}    \n\
+                vgg\t: {vgg:.4f}\n'.format(
                     epoch=self.epoch,
                     l1=val_criteria['l1'].avg,
                     psnr=val_criteria['psnr'].avg,
                     ssim=val_criteria['ssim'].avg,
-                    iou=val_criteria['iou'].avg
+                    iou=val_criteria['iou'].avg,
+                    vgg = val_criteria['vgg'].avg
                 )
             )
             for i in range(self.args.num_D):

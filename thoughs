@@ -1,0 +1,19 @@
+1. use vanilla CNN for single image discriminator, 
+	use spatio-temperal CNN for vid discriminator
+
+2. uncertainties exist in video prediction--->cVAE
+
+3. In order to let the variational distribution qφ(z|x0, F) conditioned on the starting frame, 
+	we stack x0 with each flow map fi in F as the encoder input
+
+4. occlusion in optical flow --- predict a mask
+
+5. seg2vid problems and solution:
+	1. 2d optical flow can not solve 3d motion(as can be seen, longer frames tend to have severe distortion)
+		solution: incorporate depth information
+	2. occlusion mask and post-processing network can still not inpaint new pixels well
+		solution: image inpainting networks
+
+6. todo: use segmentation and depthmap based on seg2vid structure, produce a good 2d result
+		only use gt depthmap for now to see the initial result
+	

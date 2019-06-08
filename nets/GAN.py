@@ -25,7 +25,7 @@ class GAN(nn.Module):
             self.netD = MultiscaleDiscriminator(3, ndf=64, n_layers=args.n_layer_D, norm_layer=nn.BatchNorm2d, 
                                                                 use_sigmoid=True, num_D=args.num_D, getIntermFeat=True)   
         if args.netD == 'multi_scale_img_seg':
-            self.netD = MultiscaleDiscriminator(3+1, ndf=64, n_layers=args.n_layer_D, norm_layer=nn.BatchNorm2d, 
+            self.netD = MultiscaleDiscriminator(3+20, ndf=64, n_layers=args.n_layer_D, norm_layer=nn.BatchNorm2d, 
                                                                 use_sigmoid=True, num_D=args.num_D, getIntermFeat=True)   
         if args.netD == 'motion_img' or args.netD =='motion_img_seg':
             self.netD = MotionDiscriminator(3)              
@@ -74,7 +74,7 @@ class GAN(nn.Module):
         
         # label_map[diff_map<0] = 1
         # avg to discriminator size
-        diff_map = nn.functional.avg_pool2d(diff_map, kernel_size=23, stride=4, padding=11, count_include_pad=False)
+        diff_map = nn.functional.avg_pool2d(diff_map, kernel_size=31, stride=4, padding=15, count_include_pad=False)
         label_map = torch.zeros(diff_map.size()).cuda(fake_image.get_device())
         # print("mean", torch.mean(diff_map))
         # print("std", diff_map_std)
@@ -119,13 +119,13 @@ class GAN(nn.Module):
                 label_map = self.create_disc_label_map(gt[:,:3], fake_image)
 
             elif self.args.netD == 'multi_scale_img_seg':
-                fake_input = torch.cat([fake_image, gt_seg_encoded],dim=1)
+                fake_input = torch.cat([fake_image, gt[:,3:]],dim=1)
 
                 # Fake Detection and Loss
                 pred_fake_D = self.netD(fake_input.detach())  
 
                 # Real Detection and Loss       
-                pred_real_D = self.netD(torch.cat([gt[:,:3], gt_seg_encoded],dim=1))
+                pred_real_D = self.netD(torch.cat([gt[:,:3], gt[:,3:]],dim=1))
                 # GAN loss (Fake Possibility Loss)     
                 self.set_net_grad(self.netD, False)   
                 pred_fake_G = self.netD(fake_input)
@@ -180,7 +180,12 @@ class GAN(nn.Module):
                 pred_real = self.netD(torch.cat((input, gt[:, :3]), dim=1))
             elif self.args.netD == 'multi_scale_img':
                 pred_fake = self.netD(fake_image)
-                pred_real = self.netD(gt[:, :3])
+                pred_real = self.netD(gt[:, :3]) if gt is not None else None
+                label_map = self.create_disc_label_map(gt[:,:3], fake_image) if gt is not None else None
+            elif self.args.netD == 'multi_scale_img_seg':
+                pred_fake = self.netD(torch.cat([fake_image, gt[:, 3:]], dim=1))
+                pred_real = self.netD(gt)
+                label_map = self.create_disc_label_map(gt[:,:3], fake_image)
             elif self.args.netD == 'motion_img':
                 fake_input =   torch.cat([input[:,:3], fake_image, input[:,3:6]], dim=1)
                 gt_input = torch.cat([input[:,:3], gt[:,:3], input[:,3:6]], dim=1)
