@@ -103,9 +103,11 @@ class Trainer:
         if self.args.mode == 'xs2xs':
             if self.args.syn_type == 'extra':
                 x = torch.cat([data['frame1'], data['frame2'], data['seg1'], data['seg2']], dim=1)
+                mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1)
                 gt = torch.cat([data['frame3'], data['seg3']], dim=1)
             else:
                 x = torch.cat([data['frame1'], data['frame3'], data['seg1'], data['seg3']], dim=1)
+                mask = torch.cat([data['fg_mask1'],data['fg_mask3']], dim=1)
                 gt = torch.cat([data['frame2'], data['seg2']], dim=1)        
         elif self.args.mode == 'xss2x':
             if self.args.syn_type == 'extra':
@@ -114,7 +116,7 @@ class Trainer:
             else:
                 x = torch.cat([data['frame1'], data['frame3'], data['seg1'], data['seg2'], data['seg3']], dim=1)
                 gt = data['frame2']   
-        return x, gt   
+        return x, mask, gt   
 
     def normalize(self, img):
         return (img+1)/2
@@ -162,11 +164,12 @@ class Trainer:
             # for tensorboard
             self.global_step += 1
             # forward pass
-            x, gt = self.get_input(data)
+            x, fg_mask, gt = self.get_input(data)
             x = x.cuda(self.args.rank, non_blocking=True)
+            fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True)
             gt = gt.cuda(self.args.rank, non_blocking=True)
 
-            img, seg = self.model(x)
+            img, seg = self.model(x, fg_mask)
             loss_dict = self.RGBLoss(img, gt[:, :3], False)
             if self.args.mode == 'xs2xs':
                loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(seg, torch.argmax(gt[:,3:], dim=1))   
@@ -231,12 +234,13 @@ class Trainer:
                 self.step=i
 
                 # forward pass
-                x, gt = self.get_input(data)
+                x, fg_mask, gt = self.get_input(data)
                 size = x.size(0)
                 x = x.cuda(self.args.rank, non_blocking=True)
+                fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True)
                 gt = gt.cuda(self.args.rank, non_blocking=True)
                 
-                img, seg = self.model(x)
+                img, seg = self.model(x, fg_mask)
 
                 # rgb criteria
                 step_losses['l1'] =   self.L1Loss(img, gt[:,:3])

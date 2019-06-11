@@ -167,7 +167,7 @@ class MyFRRN(nn.Module):
 		# self.SegLoss = nn.CrossEntropyLoss()
 
 
-	def forward(self, input, gt=None):
+	def forward(self, input, mask=None, gt=None):
 		if self.args.mode in ['xs2xs', 'edge']:
 			encoded_segs = [
 				self.seg_encoder(input[:, 6:6+self.n_classes]),

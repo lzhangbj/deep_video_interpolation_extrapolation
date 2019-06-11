@@ -20,9 +20,9 @@ class VAE(nn.Module):
 		self.seg_encoder = SegEncoder(in_dim=20, out_dim=4)
 
 		# BG
-		self.flow_encoder_bg = FlowEncoder(args,in_dim=3*(args.vid_length+1)+args.seg_dim)
+		self.flow_encoder_bg = FlowEncoder(args,in_dim=3*(args.vid_length+1)+args.seg_dim,latent_dim=128)
 		# FG
-		self.flow_encoder_fg = FlowEncoder(args,in_dim=3*(args.vid_length+1)+args.seg_dim)
+		self.flow_encoder_fg = FlowEncoder(args,in_dim=3*(args.vid_length+1)+args.seg_dim,latent_dim=896)
 
 		self.encoder = encoder(args)
 		self.flow_decoder = decoder(args)
@@ -84,8 +84,7 @@ class VAE(nn.Module):
 		if z_m is None:
 
 			y = torch.cat(
-				[frame1, frame2.contiguous().view(-1, args.vid_length * 3, args.input_size[0], args.input_size[1]) -
-					frame1.repeat(1, args.vid_length, 1, 1)], 1)
+				[frame1, frame2.contiguous().view(-1, args.vid_length * 3, args.input_size[0], args.input_size[1])], 1)
 
 			# Motion Network --> compute latent vector
 

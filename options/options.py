@@ -57,7 +57,7 @@ class Options():
 		self.parser.add_argument('--sharp_w', dest='sharp_weight',
 												help='training optimizer loss weigh of feat',
 												type=float,
-												default=20) 
+												default=0) 
 		self.parser.add_argument('--gdl_w', dest='gdl_weight',
 												help='training optimizer loss weigh of gdl',
 												type=float,
@@ -110,6 +110,10 @@ class Options():
 												type=str)
 
 
+		self.parser.add_argument('--ef', dest='effec_flow',
+												help='whether eval after each training ', 
+												action='store_true')
+
 		# resume
 		# set training session
 		self.parser.add_argument('--s', dest='session',
@@ -150,7 +154,7 @@ class Options():
 		generator_parser.add_argument('--model', dest='model', 
 										default='MyFRRN', 
 										help='model to use',
-										choices=['GridNet', 'MyFRRN'])  
+										choices=['GridNet', 'MyFRRN', 'UNet','SepUNet'])  
 		generator_parser.add_argument('--o', dest='optimizer', 
 										help='training optimizer',
 										choices =['adamax','adam', 'sgd'], 

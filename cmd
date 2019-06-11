@@ -10,3 +10,13 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=6 python main.py  --disp_inter
 
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1,2,4 python main.py  --disp_interval 100 --mode xs2xs --syn_type extra --bs 32  --nw 8  --s 0 --epochs 30  --interval 1 --vid_len 4 vae
+
+
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0  python main.py  --disp_interval 100 --mode xs2xs --syn_type inter --bs 60  --nw 5  --s 10  --interval 1 --val --checksession 10 --checkepoch_range --checkpoint 1388 --checkepoch_low 20 --checkepoch_up 25 --load_dir log/MyFRRN_xs2xs_inter_10_06-09-19:41:50 gen --model MyFRRN
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3,4,5  python main.py  --disp_interval 100 --mode xs2xs --syn_type inter --bs 48 --nw 8  --s 10 --interval 1 --epochs 30  gen --model SepUNet
+
+
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=6  python main.py  --disp_interval 100 --mode xs2xs --syn_type inter --bs 48  --nw 4  --s 11  --interval 1 --val --checksession 11 --checkepoch_range --checkpoint 1266 --checkepoch_low 20 --checkepoch_up 24 --load_dir log/MyFRRN_xs2xs_inter_11_06-10-00:36:22 gen --model MyFRRN

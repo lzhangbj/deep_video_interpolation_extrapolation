@@ -123,7 +123,7 @@ class VAEer:
 
     def prepare_image_set(self, data, y_pred, y_pred_before_refine, flow, flowback, mask_fw, mask_bw,\
                             seg_pred=None, seg_gt=None):
-        view_gt_rgbs = [   data['frames'][0, i] for i in range(self.args.vid_length+1) ]
+        view_gt_rgbs = [ data['frames'][0, i] for i in range(self.args.vid_length+1) ]
         blank_image = torch.zeros_like(view_gt_rgbs[0])
         blank_image_bw = self.create_heatmap(torch.zeros_like(mask_fw[0,0]))
 
@@ -181,11 +181,11 @@ class VAEer:
             # forward pass
             rgb_data = data['frames'].cuda(self.args.rank, non_blocking=True)
             seg_data = data['segs'].cuda(self.args.rank, non_blocking=True)
-            disparity_data = data['disparities'].cuda(self.args.rank, non_blocking=True)
+            # disparity_data = data['disparities'].cuda(self.args.rank, non_blocking=True)
             fg_masks = data['fg_masks'].cuda(self.args.rank, non_blocking=True)
             bg_masks = data['bg_masks'].cuda(self.args.rank, non_blocking=True)
 
-            noise_bg = torch.randn(rgb_data[:, 0].size()).cuda(self.args.rank, non_blocking=True)
+            noise_bg = torch.zeros(rgb_data[:, 0].size()).cuda(self.args.rank, non_blocking=True)
 
 
             if not self.args.seg and not self.args.disparity:
@@ -243,7 +243,7 @@ class VAEer:
                     )
                     comp_time = 0
                     load_time = 0
-                if self.step % 50 == 0:
+                if self.step % 30 == 0:
                     if not self.args.seg: 
                         image_set = self.prepare_image_set(data, y_pred.cpu(), y_pred_before_refine.cpu(), \
                                                 flow.cpu(), flowback.cpu(), mask_fw.cpu(), mask_bw.cpu())

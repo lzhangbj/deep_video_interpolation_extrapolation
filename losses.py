@@ -556,14 +556,14 @@ class losses_multigpu_only_mask(nn.Module):
         mask_loss = (1 - mask_bw).mean() + (1 - mask_fw).mean()
         d = OrderedDict([
                 ('flow', flowloss),
-                ('recon',2*reconloss), #20
-                ('recon_back', 10*reconloss_back),
-                ('recon_before', 10*reconloss_before),
-                ('kld', 0.1*kldloss),
-                ('flowcon', 10*flowcon),
-                ('sim', 0.5*sim_loss),
-                ('vgg', 0.6*vgg_loss),
-                ('mask', 0.5*mask_loss)
+                ('recon',0*reconloss), #2
+                ('recon_back', 2*reconloss_back), # 10
+                ('recon_before', 2*reconloss_before),
+                ('kld', 0.2*kldloss),
+                ('flowcon', flowcon),
+                ('sim', 0*sim_loss), # 0.5
+                ('vgg', 0*vgg_loss), # 0.6
+                ('mask', 0.2*mask_loss) # 1
             ])
 
         if self.opt.seg:

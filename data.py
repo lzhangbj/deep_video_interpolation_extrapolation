@@ -21,20 +21,23 @@ import pickle
 def get_dataset(args):
 	### explicitly set flip = True #######
 	if args.dataset == "cityscape":
-		clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/int_{}_len_4_extra_lsclip.pkl".format(args.interval)
+		clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/int_{}_len_3_extra_lsclip.pkl".format(args.interval)
+		if args.effec_flow:
+			clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/effec_flow_int_{}_len_3_extra_lsclip.pkl".format(args.interval)
 		with open(clip_file, 'rb') as f:
 			load_f = pickle.load(f)
 			clips_train_file = load_f['train'] 
 			clips_val_file = load_f['val'] 
-		train_dataset = ImageFolder(args, clips_train_file,
+
+		train_dataset = ImageFolder(args, clips_train_file, 
 												transform=transforms.Compose([
-													transforms.Resize((150,150), interpolation=Image.NEAREST),
-													transforms.RandomCrop((128,128))
+													transforms.Resize((150,300), interpolation=Image.NEAREST),
+													transforms.RandomCrop((128,256))
 												])
 											)
-		val_dataset = ImageFolder(args, clips_val_file,
+		val_dataset = ImageFolder(args, clips_val_file, 
 												transform=transforms.Compose([
-													transforms.Resize((128,128), interpolation=Image.NEAREST)
+													transforms.Resize((128,256), interpolation=Image.NEAREST)
 												])
 											)
 		# val_dataset = ImageFolder(args, clips_val_file,transform=None)

@@ -35,7 +35,7 @@ class SegEncoder(nn.Module):
 	logvar_fc   --> (bs*4, 512) 
 '''
 class FlowEncoder(nn.Module):
-	def __init__(self, args, in_dim):
+	def __init__(self, args, in_dim, latent_dim=512):
 		super(FlowEncoder, self).__init__()
 		self.args = args
 		self.in_dim=in_dim
@@ -56,8 +56,8 @@ class FlowEncoder(nn.Module):
 			nn.LeakyReLU(0.2, inplace=True),
 			nn.Conv2d(128, 48, 5, 2, 2, bias=False)  # 8
 			)
-		self.mu_fc = nn.Linear(1024, args.latent_dim)
-		self.logvar_fc = nn.Linear(1024, args.latent_dim)
+		self.mu_fc = nn.Linear(1024, latent_dim)
+		self.logvar_fc = nn.Linear(1024, latent_dim)
 	def forward(self, input):
 		seq_out = self.sequence(input).view(-1, 1024)
 
@@ -141,10 +141,33 @@ class upconv(nn.Module):
 class encoder(nn.Module):
 	def __init__(self, args):
 		super(encoder, self).__init__()
-		self.econv1 = convbase(3+args.seg_dim, 32, 5, 2, 2)  # 32,64,64
-		self.econv2 = convblock(32, 64, 5, 2, 2)  # 64,32,32
-		self.econv3 = convblock(64, 128, 5, 2, 2)  # 128,16,16
-		self.econv4 = convblock(128, 256, 5, 2, 2)  # 256,8,8
+		self.econv1 = nn.Sequential(
+				convbase(3+args.seg_dim, 32, 3,1,1),
+				convblock(32, 32, 3,1,1)				# 32, 128, 128
+			)
+
+		self.econv2 = nn.Sequential(
+				convblock(32, 64, 5, 2, 2),
+				convblock(64, 64, 3,1,1),  
+				convblock(64, 64, 3,1,1)  		# 64,64,64
+			)
+
+		self.econv3 = nn.Sequential(
+				convblock(64, 128, 5, 2, 2),  
+				convblock(128, 128, 3, 1, 1),  
+				convblock(128, 128, 3, 1, 1)  # 128,32,32
+			)
+
+		self.econv4 = nn.Sequential(
+				convblock(128, 256, 5, 2, 2), 
+				convblock(256, 256, 3, 1, 1)  # 256,16,16
+			)
+
+		self.econv5 = nn.Sequential(
+				convblock(256, 256, 5, 2, 2),
+				convblock(256, 256, 3,1,1)  # 256,8,8
+			)
+		# self.econv5_1 = 
 
 	def forward(self, x):
 		enco1 = self.econv1(x)  # 32
