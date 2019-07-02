@@ -1,8 +1,0 @@
-1. simply send in the images is difficult to learn
-	vid2vid send in extra information (seg , flow), we should send in ground truth seg for it to learn
-
-	try send in (seg, img)
-
-2. how to design a motion discriminator?
-	simply send in 3 images is naiive and does not work well?
-	direct attention doesn't seem to work? ( how to verify the attention helps ? )
