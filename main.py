@@ -5,19 +5,26 @@ import pathlib
 import random
 import socket
 import sys
+import pickle
 
 import torch
 import torch.distributed as dist 
 import torch.multiprocessing as mp 
 import numpy as np 
 
+from utils.net_utils import *
+
 from runners.trainer import Trainer
 from runners.VAEer import VAEer
 from runners.ganer import GANer
+from runners.refiner import Refiner
+from runners.refiner_gan import RefinerGAN
 from options.gan_options import GANOptions
 from options.generator_options import GenOptions
 from options.options import Options
 from subprocess import call
+
+from time import time
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -55,7 +62,7 @@ def get_logger(path, rank=None):
 
 
 def worker(rank, args):
-	if not args.val:
+	if args.split == 'train':
 		logger = get_logger(args.path + '/experiment.log',
 						rank) # process specific logger
 	else:
@@ -78,10 +85,17 @@ def worker(rank, args):
 		trainer = GANer(args)
 	elif args.runner == 'vae':
 		trainer = VAEer(args)
+	elif args.runner == 'refine':
+		trainer = Refiner(args)
+	elif args.runner == 'refine_gan':
+		trainer = RefinerGAN(args)
 	else:
 		raise Exception("speficied runner does not exist !")
 
-	if args.val:
+	if args.split == 'test':
+		trainer.test()
+
+	elif args.split == 'val':
 		if args.checkepoch_range:
 			for i in range(args.checkepoch_low, args.checkepoch_up+1):
 				args.checkepoch = i
@@ -89,13 +103,32 @@ def worker(rank, args):
 				trainer.validate()
 		else:
 			trainer.validate()
-	else:
+	elif args.split=='cycgen':
+		if args.cycgen_all:
+			clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl"
+			with open(clip_file, 'rb') as f:
+				clips = pickle.load(f)
+				clips = clips['val']
+			end = time()
+			for step, t in enumerate(clips):
+				if step > 60:
+					break
+				trainer.args.cyc_prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/leftImg8bit_sequence/' + t[0]
+				trainer.cycgen()
+				spend = time() -  end
+				end = time()
+				sys.stdout.write('\r {}/{} {} {:.2f}s'.format(step, len(clips), trainer.args.cyc_prefix, spend))
+		else:
+			trainer.cycgen()
+	elif args.split == 'train':
 		for epoch in range(trainer.epoch-1, args.epochs):
 			trainer.set_epoch(epoch)
+			# if args.resume and args.lock_retrain and (epoch-trainer.epoch+1)%5 == 0 and  epoch!= trainer.epoch-1:
+			#   adjust_learning_rate(trainer.optimizer, decay=0.1)
 			trainer.train()
 			# metrics = trainer.validate() disable validation
 
-			if args.rank == 0:	# gpu id
+			if args.rank == 0:  # gpu id
 				trainer.save_checkpoint()
 
 
@@ -105,7 +138,7 @@ def main():
 	
 	# exp path
 	args.path = get_exp_path(args)
-	if args.resume or args.val or ( args.runner == 'gan' and args.load_G):
+	if args.resume or args.split =='val' or ( args.runner == 'gan' and args.load_G):
 		args.path = args.load_dir
 	else:
 		pathlib.Path(args.path).mkdir(parents=True, exist_ok=False)
@@ -119,7 +152,7 @@ def main():
 			args.port = int(s.getsockname()[1])
 
 	# logger
-	if args.val:
+	if args.split == 'val':
 		logger = get_logger(args.path + '/experiment_val.log') if args.interval == 2 else \
 					 get_logger(args.path + '/experiment_val_int_1.log')
 	else:

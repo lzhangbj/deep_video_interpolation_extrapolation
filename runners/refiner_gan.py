@@ -7,6 +7,7 @@ import itertools
 import shutil
 from collections import OrderedDict
 
+import glob
 import numpy as np
 from torch.autograd import Variable
 import torch
@@ -32,11 +33,8 @@ def get_model(args):
     model = nets.__dict__[args.model](args)
     return model
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-
-class Trainer:
+class RefinerGAN:
     def __init__(self, args):
         self.args = args
 
@@ -44,27 +42,37 @@ class Trainer:
         # if not os.path.isdir('../predict'):       only used in validation
         #     os.makedirs('../predict')
         self.model = get_model(args)
-        params_cnt = count_parameters(self.model)
-        print("params ", params_cnt)
+        if self.args.lock_coarse:
+            for p in self.model.coarse_model.parameters():
+                p.requires_grad = False
         torch.cuda.set_device(args.rank)
         self.model.cuda(args.rank)
         self.model = torch.nn.parallel.DistributedDataParallel(self.model,
                 device_ids=[args.rank])
         train_dataset, val_dataset = get_dataset(args)
 
-        if args.split == 'train':
+        if not args.val:
             # train loss
-            self.RGBLoss = RGBLoss(args, sharp=True)
+            self.coarse_RGBLoss = RGBLoss(args, sharp=False)
+            self.refine_RGBLoss = RGBLoss(args, sharp=False, refine=True)
             self.SegLoss = nn.CrossEntropyLoss()
-            self.RGBLoss.cuda(args.rank)
+            self.GANLoss = GANLoss(tensor=torch.FloatTensor)
+
+            self.coarse_RGBLoss.cuda(args.rank)
+            self.refine_RGBLoss.cuda(args.rank)
             self.SegLoss.cuda(args.rank)
+            self.GANLoss.cuda(args.rank)
 
             if args.optimizer == "adamax":
-                self.optimizer = torch.optim.Adamax(list(self.model.parameters()), lr=args.learning_rate)
+                self.optG = torch.optim.Adamax(list(self.model.module.coarse_model.parameters()) + list(self.model.module.refine_model.parameters()), lr=args.learning_rate)
             elif args.optimizer == "adam":
-                self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.learning_rate)
+                self.optG = torch.optim.Adam(self.model.parameters(), lr=args.learning_rate)
             elif args.optimizer == "sgd":
-                self.optimizer = torch.optim.SGD(self.model.parameters(), lr=args.learning_rate, momentum=0.9)
+                self.optG = torch.optim.SGD(self.model.parameters(), lr=args.learning_rate, momentum=0.9)
+
+            # self.optD = torch.optim.Adam(self.model.module.discriminator.parameters(), lr=args.learning_rate)
+            self.optD = torch.optim.SGD(self.model.module.discriminator.parameters(), lr=args.learning_rate, momentum=0.9)
+
 
             train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
             self.train_loader = torch.utils.data.DataLoader(
@@ -87,67 +95,122 @@ class Trainer:
         torch.backends.cudnn.benchmark = True
         self.global_step = 0
         self.epoch=1
-        if args.resume or ( args.split != 'train' and not args.checkepoch_range):
+        if args.resume or (args.val and not args.checkepoch_range):
             self.load_checkpoint()
 
         if args.rank == 0:
-            writer_name = args.path+'/{}_int_{}_{}_logs'.format(self.args.split, self.args.interval, self.args.dataset)
-            self.writer = SummaryWriter(writer_name)
+            if args.val:
+                self.writer =  SummaryWriter(args.path+'/val_logs') if args.interval == 2 else\
+                                SummaryWriter(args.path+'/val_int_1_logs')
+            else:
+                self.writer = SummaryWriter(args.path+'/logs')
+        self.heatmap = self.create_stand_heatmap()
+
+    def prepare_heat_map(self, prob_map):
+        bs, c, h, w = prob_map.size()
+        if h!=128:
+            prob_map_ = F.interpolate(prob_map, size=(128, 256), mode='nearest', align_corners=True)
+        return prob_map
+
+    def create_heatmap(self, prob_map):
+        c, h, w = prob_map.size()
+        assert c==1, c
+        assert h==128, h
+        rgb_prob_map = torch.zeros(3, h, w)
+        minimum, maximum = 0.0, 1.0
+        ratio = 2 * (prob_map-minimum) / (maximum - minimum)
+
+        rgb_prob_map[0] = 1-ratio
+        rgb_prob_map[1] = ratio-1
+        rgb_prob_map[:2].clamp_(0,1)
+        rgb_prob_map[2] = 1-rgb_prob_map[0]-rgb_prob_map[1]
+        return rgb_prob_map
+
+    def create_stand_heatmap(self):
+        heatmap = torch.zeros(3, 128, 256)
+        for i in range(256):
+            heatmap[0, :, i] = max(0, 1 - 2.*i/256)
+            heatmap[1, :, i] = max(0, 2.*i/256 - 1)
+            heatmap[2, :, i] = 1-heatmap[0, :, i]-heatmap[1, :, i]
+        return heatmap
 
 
     def set_epoch(self, epoch):
         self.args.logger.info("Start of epoch %d" % (epoch+1))
         self.epoch = epoch + 1
         self.train_loader.sampler.set_epoch(epoch)
+        # self.val_loader.sampler.set_epoch(epoch)
 
     def get_input(self, data):
-        if self.args.syn_type == 'extra':
-            x = torch.cat([data['frame1'], data['frame2']], dim=1)
-            seg = torch.cat([data['seg1'], data['seg2']], dim=1) if self.args.mode == 'xs2xs' else None
-            mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1) if self.args.mode == 'xs2xs' else None
-            gt_x = data['frame3']
-            gt_seg = data['seg3'] if self.args.mode == 'xs2xs' else None
-        else:
-            x = torch.cat([data['frame1'], data['frame3']], dim=1)
-            seg = torch.cat([data['seg1'], data['seg3']], dim=1) if self.args.mode == 'xs2xs' else None
-            mask = torch.cat([data['fg_mask1'],data['fg_mask3']], dim=1) if self.args.mode == 'xs2xs' else None
-            gt_x = data['frame2'] 
-            gt_seg = data['seg2']  if self.args.mode == 'xs2xs' else None
-        return x, seg, mask, gt_x, gt_seg    
+        if self.args.mode == 'xs2xs':
+            if self.args.syn_type == 'extra':
+                x = torch.cat([data['frame1'], data['frame2'], data['seg1'], data['seg2']], dim=1)
+                mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1)
+                gt = torch.cat([data['frame3'], data['seg3']], dim=1)
+            else:
+                x = torch.cat([data['frame1'], data['frame3'], data['seg1'], data['seg3']], dim=1)
+                mask = torch.cat([data['fg_mask1'],data['fg_mask3']], dim=1)
+                gt = torch.cat([data['frame2'], data['seg2']], dim=1)        
+        elif self.args.mode == 'xss2x':
+            if self.args.syn_type == 'extra':
+                x = torch.cat([data['frame1'], data['frame2'], data['seg1'], data['seg2'], data['seg3']], dim=1)
+                gt = data['frame3']   
+            else:
+                x = torch.cat([data['frame1'], data['frame3'], data['seg1'], data['seg2'], data['seg3']], dim=1)
+                gt = data['frame2']   
+        return x, mask, gt   
 
     def normalize(self, img):
         return (img+1)/2
 
-    def prepare_image_set(self, data, img, seg, extra=False):
+    def prepare_image_set(self, data, coarse_img, refined_imgs, seg, pred_fake, pred_real, extra=False):
         view_rgbs = [   self.normalize(data['frame1'][0]), 
                         self.normalize(data['frame2'][0]), 
                         self.normalize(data['frame3'][0])   ]
-        if self.args.mode == 'xs2xs':
-            view_segs = [vis_seg_mask(data['seg'+str(i)][0].unsqueeze(0), 20).squeeze(0) for i in range(1, 4)]
-        else:
-            view_segs = []
+        view_segs = [vis_seg_mask(data['seg'+str(i)][0].unsqueeze(0), 20).squeeze(0) for i in range(1, 4)]
+
+
+        # gan
+        view_probs = []
+        view_probs.append(self.heatmap)
+
+        for i in range(self.args.num_D):
+            toDraw = F.interpolate(pred_real[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
+            view_probs.append(self.create_heatmap(toDraw))
+            toDraw = F.interpolate(pred_fake[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
+            view_probs.append(self.create_heatmap(toDraw))        
 
         if not extra:
-            insert_index = 2 
-            pred_rgb = self.normalize(img[0])
+            # coarse
+            pred_rgb = self.normalize(coarse_img[0])
+            pred_seg = vis_seg_mask(seg[0].unsqueeze(0), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
+            insert_index = 2 if self.args.syn_type == 'inter' else 3
+            
             view_rgbs.insert(insert_index, pred_rgb)
-            if self.args.mode == 'xs2xs':
-                pred_seg = vis_seg_mask(seg[0].unsqueeze(0), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
-                view_segs.insert(insert_index, pred_seg)
-            write_in_img = make_grid(view_rgbs + view_segs, nrow=4)
-        else:
-            pass
-            # view_rgbs.insert(3, torch.zeros_like(view_rgbs[-1]))
-            # view_segs.insert(3, torch.zeros_like(view_segs[-1]))
+            view_segs.insert(insert_index, pred_seg)
+            view_segs.append(torch.zeros_like(view_segs[-1]))
+            # refine
+            refined_bs_imgs = [ refined_img[0].unsqueeze(0) for refined_img in refined_imgs ] 
+            for i in range(self.args.n_scales):
+                insert_img = F.interpolate(refined_bs_imgs[i], size=(128,256))[0].clamp_(-1, 1) 
 
-            # view_pred_rgbs = []
-            # view_pred_segs = []
-            # for i in range(self.args.extra_length):
-            #     pred_rgb = self.normalize(img[i][0].cpu())
-            #     pred_seg = vis_seg_mask(seg[i].cpu(), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
-            #     view_pred_rgbs.append(pred_rgb)
-            #     view_pred_segs.append(pred_seg)
-            # write_in_img = make_grid(view_rgbs + view_segs + view_pred_rgbs + view_pred_segs, nrow=4)
+                pred_rgb = self.normalize(insert_img)
+                insert_ind = insert_index + i+1
+                view_rgbs.insert(insert_ind, pred_rgb)
+
+            write_in_img = make_grid(view_rgbs + view_segs + view_probs, nrow=4+self.args.n_scales)
+        # else:
+        #     view_rgbs.insert(3, torch.zeros_like(view_rgbs[-1]))
+        #     view_segs.insert(3, torch.zeros_like(view_segs[-1]))
+
+        #     view_pred_rgbs = []
+        #     view_pred_segs = []
+        #     for i in range(self.args.extra_length):
+        #         pred_rgb = self.normalize(img[i][0].cpu())
+        #         pred_seg = vis_seg_mask(seg[i].cpu(), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
+        #         view_pred_rgbs.append(pred_rgb)
+        #         view_pred_segs.append(pred_seg)
+        #     write_in_img = make_grid(view_rgbs + view_segs + view_pred_rgbs + view_pred_segs, nrow=4)
 
         
         return write_in_img
@@ -158,21 +221,6 @@ class Trainer:
         end = time()
         load_time = 0
         comp_time = 0
-        l1_loss_record = 0
-        ssim_loss_record = 0
-        vgg_loss_record = 0
-        ce_loss_record = 0
-
-        loss_all_record = 0
-        data_all_count = 0
-        epoch_data_all_count = 0
-
-        epoch_l1_loss_record = 0
-        epoch_ssim_loss_record = 0
-        epoch_vgg_loss_record = 0
-        epoch_loss_all_record = 0
-        epoch_ce_loss_record = 0
-
         for step, data in enumerate(self.train_loader):
             self.step = step
             load_time += time() - end
@@ -180,101 +228,90 @@ class Trainer:
             # for tensorboard
             self.global_step += 1
             # forward pass
-            x, seg, fg_mask, gt_x, gt_seg = self.get_input(data)
+            x, fg_mask, gt = self.get_input(data)
             x = x.cuda(self.args.rank, non_blocking=True)
-            seg = seg.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
-            fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True) if self.args.mode == 'xs2xs' else None
-            gt_seg = gt_seg.cuda(self.args.rank, non_blocking=True) if self.args.mode == 'xs2xs' else None
-            gt_x = gt_x.cuda(self.args.rank, non_blocking=True)
-            
-            batch_size_p = x.size(0)
-            data_all_count += batch_size_p
-            epoch_data_all_count += batch_size_p
+            fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True)
+            gt = gt.cuda(self.args.rank, non_blocking=True)
 
-            img, seg = self.model(x, fg_mask)
-            loss_dict = self.RGBLoss(img, gt_x, False)
-            if self.args.mode == 'xs2xs':
-               loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(seg, torch.argmax(gt_seg, dim=1))   
+            coarse_img, refined_imgs, seg, pred_fake_D, pred_real_D, pred_fake_G = self.model(x, fg_mask, gt)
+            if not self.args.lock_coarse:
+                loss_dict = self.coarse_RGBLoss(coarse_img, gt[:, :3], False)
+                if self.args.mode == 'xs2xs':
+                   loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(seg, torch.argmax(gt[:,3:], dim=1))   
+            else:
+                loss_dict = OrderedDict()
+            for i in range(self.args.n_scales):
+                # print(i, refined_imgs[-i].size())
+                loss_dict.update(self.refine_RGBLoss(refined_imgs[-i-1], F.interpolate(gt[:,:3], scale_factor=(1/2)**i, mode='bilinear', align_corners=True),\
+                                                                     refine_scale=1/(2**i), step=self.global_step, normed=False))
             # loss and accuracy
             loss = 0
             for i in loss_dict.values():
                 loss += torch.mean(i)
             loss_dict['loss_all'] = loss
-            
-            self.sync(loss_dict)
-            # backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
 
-            # init step in the first train steps
-            self.optimizer.step()
+            if self.global_step > 1000:
+                loss_dict['adv_loss'] = self.args.refine_adv_weight*self.GANLoss(pred_fake_G, True)
+                
+                g_loss = loss_dict['loss_all'] + loss_dict['adv_loss']
+
+                loss_dict['d_real_loss'] = self.args.refine_d_weight*self.GANLoss(pred_real_D, True)
+                loss_dict['d_fake_loss'] = self.args.refine_d_weight*self.GANLoss(pred_fake_D, False)
+                loss_dict['d_loss'] = loss_dict['d_real_loss'] + loss_dict['d_fake_loss']
+
+            else:
+                g_loss = loss_dict['loss_all'] 
+
+                loss_dict['d_real_loss'] = 0*self.GANLoss(pred_real_D, True)
+                loss_dict['d_fake_loss'] = 0*self.GANLoss(pred_fake_D, False)
+                loss_dict['d_loss'] = loss_dict['d_real_loss'] + loss_dict['d_fake_loss']               
+
+            self.sync(loss_dict)
+
+            self.optG.zero_grad()
+            g_loss.backward()
+            self.optG.step()
+
+            # discriminator backward pass
+            self.optD.zero_grad()
+            loss_dict['d_loss'].backward()
+            self.optD.step()
             comp_time += time() - end
             end = time()
-
-            l1_loss_record   += batch_size_p*loss_dict['l1_loss'].item()
-            ssim_loss_record += batch_size_p*loss_dict['ssim_loss'].item()
-            vgg_loss_record  += batch_size_p*loss_dict['vgg_loss'].item()
-            loss_all_record  = (l1_loss_record + ssim_loss_record + vgg_loss_record)
-            ce_loss_record   += batch_size_p*loss_dict['ce_loss'].item() if self.args.mode=='xs2xs' else 0
-
-            epoch_l1_loss_record   += batch_size_p*loss_dict['l1_loss'].item()
-            epoch_ssim_loss_record += batch_size_p*loss_dict['ssim_loss'].item()
-            epoch_vgg_loss_record  += batch_size_p*loss_dict['vgg_loss'].item()
-            epoch_ce_loss_record   += batch_size_p*loss_dict['ce_loss'].item() if self.args.mode=='xs2xs' else 0
 
             if self.args.rank == 0:
                 # add info to tensorboard
                 info = {key:value.item() for key,value in loss_dict.items()}
+                # add discriminator value
+                pred_value = 0
+                real_value = 0
+                for i in range(self.args.num_D):
+                    pred_value += torch.mean(pred_fake_D[i][-1])
+                    real_value += torch.mean(pred_real_D[i][-1])
+                pred_value/=self.args.num_D
+                real_value/=self.args.num_D
+                info["fake"] = pred_value.item()
+                info["real"] = real_value.item()
                 self.writer.add_scalars("losses", info, self.global_step)
                 # print
                 if self.step % self.args.disp_interval == 0:
-                    if data_all_count != 0:
-                        l1_loss_record   /= data_all_count
-                        ssim_loss_record /= data_all_count
-                        vgg_loss_record  /= data_all_count
-                        loss_all_record  /= data_all_count
-                        ce_loss_record   /= data_all_count
-
                     self.args.logger.info(
                         'Epoch [{epoch:d}/{tot_epoch:d}][{cur_batch:d}/{tot_batch:d}] '
                         'load [{load_time:.3f}s] comp [{comp_time:.3f}s] '
-                        '\n\t\tl1 [{l1:.4f}] vgg [{vgg:.4f}] ssim [{ssim:.4f}] rgb_all [{rgb_all:.4f}] ce  [{ce:.4f}] '.format(
+                        'loss [{loss:.4f}]'.format(
                             epoch=self.epoch, tot_epoch=self.args.epochs,
                             cur_batch=self.step+1, tot_batch=len(self.train_loader),
                             load_time=load_time, comp_time=comp_time,
-                            l1=l1_loss_record, vgg=vgg_loss_record, ssim=ssim_loss_record, rgb_all=loss_all_record, ce=ce_loss_record
+                            loss=loss.item()
                         )
                     )
                     comp_time = 0
                     load_time = 0
-                    l1_loss_record = 0
-                    ssim_loss_record = 0
-                    vgg_loss_record = 0
-                    loss_all_record = 0
-                    ce_loss_record = 0
-
-                    loss_all_record = 0                    
-                    data_all_count = 0
-
-                if self.step % 30 == 0: 
-                    image_set = self.prepare_image_set(data, img.cpu(), seg)
+                if self.step % 50 == 0: 
+                    image_set = self.prepare_image_set(data, coarse_img.cpu(), [ refined_img.cpu() for refined_img in refined_imgs], seg.cpu(), \
+                                            pred_fake_D, pred_real_D)
                     self.writer.add_image('image_{}'.format(self.global_step), image_set, self.global_step)
 
-        epoch_loss_all_record  = (epoch_l1_loss_record + epoch_ssim_loss_record + epoch_vgg_loss_record)
-        
-        epoch_l1_loss_record   /= epoch_data_all_count
-        epoch_ssim_loss_record /= epoch_data_all_count
-        epoch_vgg_loss_record  /= epoch_data_all_count
-        epoch_loss_all_record  /= epoch_data_all_count
-        epoch_ce_loss_record   /= epoch_data_all_count
-        if self.args.rank == 0:
-            self.args.logger.info(
-                'Epoch [{epoch:d}/{tot_epoch:d}] '
-                '\n\t\t\tl1 [{l1:.4f}] vgg [{vgg:.4f}] ssim [{ssim:.4f}] rgb_all [{rgb_all:.4f}] ce  [{ce:.4f}] '.format(
-                    epoch=self.epoch,tot_epoch=self.args.epochs,
-                    l1=epoch_l1_loss_record, vgg=epoch_vgg_loss_record, ssim=epoch_ssim_loss_record, rgb_all=epoch_loss_all_record, ce=epoch_ce_loss_record
-                )
-            )
 
     def validate(self):
         self.args.logger.info('Validation epoch {} started'.format(self.epoch))
@@ -305,19 +342,18 @@ class Trainer:
                 fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True)
                 gt = gt.cuda(self.args.rank, non_blocking=True)
                 
-                img, seg = self.model(x, fg_mask)
-
+                coarse_img, refined_imgs, seg, pred_fake_D, pred_real_D= self.model(x, fg_mask, gt)
                 # rgb criteria
-                step_losses['l1'] =   self.L1Loss(img, gt[:,:3])
-                step_losses['psnr'] = self.PSNRLoss((img+1)/2, (gt[:,:3]+1)/2)
-                step_losses['ssim'] = 1-self.SSIMLoss(img, gt[:,:3])
+                step_losses['l1'] =   self.L1Loss(refined_imgs[-1], gt[:,:3])
+                step_losses['psnr'] = self.PSNRLoss((refined_imgs[-1]+1)/2, (gt[:,:3]+1)/2)
+                step_losses['ssim'] = 1-self.SSIMLoss(refined_imgs[-1], gt[:,:3])
                 step_losses['iou'] =  self.IoULoss(torch.argmax(seg, dim=1), torch.argmax(gt[:,3:], dim=1))
-                step_losses['vgg'] =  self.VGGCosLoss(img, gt[:, :3], False)
+                step_losses['vgg'] =  self.VGGCosLoss(refined_imgs[-1], gt[:, :3], False)
                 self.sync(step_losses) # sum
                 for key in list(val_criteria.keys()):
                     val_criteria[key].update(step_losses[key].cpu().item(), size*self.args.gpus)
 
-                if self.args.syn_type == 'extra':
+                if self.args.syn_type == 'extra': # not implemented
                     imgs = []
                     segs = []
                     img = img[0].unsqueeze(0)
@@ -332,9 +368,6 @@ class Trainer:
                         imgs.append(img)
                         segs.append(seg_fil)
                         
-
-
-
                 comp_time += time() - end
                 end = time()
 
@@ -352,7 +385,8 @@ class Trainer:
                         load_time = 0
                     if self.step % 3 == 0:
                         if self.args.syn_type == 'inter':
-                            image_set = self.prepare_image_set(data, img, seg)
+                            image_set = self.prepare_image_set(data, coarse_img.cpu(), [ refined_img.cpu() for refined_img in refined_imgs], seg.cpu(), \
+                                            pred_fake_D, pred_real_D)
                         else:
                             image_set = self.prepare_image_set(data, imgs, segs, True)
                         image_name = 'e{}_img_{}'.format(self.epoch, self.step)
@@ -376,7 +410,6 @@ vgg\t: {vgg:.4f}\n'.format(
             )
             tfb_info = {key:value.avg for key,value in val_criteria.items()}
             self.writer.add_scalars('val/score', tfb_info, self.epoch)
-
 
     def test(self):
         self.args.logger.info('testing started')
@@ -404,11 +437,11 @@ vgg\t: {vgg:.4f}\n'.format(
 
                 bs = img.size(0)
                 for i in range(bs):
-                    pred_img = self.normalize(F.interpolate(img[i].unsqueeze(0), scale_factor=4, mode='bilinear', align_corners=True)[0])
-                    # gt_img = self.normalize(gt[i, :3])
+                    pred_img = self.normalize(img[i])
+                    gt_img = self.normalize(gt[i, :3])
 
-                    save_image(pred_img, '{}/{}_pred.png'.format(self.args.save_dir, img_count))
-                    # save_image(gt_img, '{}/{}_gt.png'.format(self.args.save_dir, img_count))
+                    save_img(pred_img, '{}/{}_pred.png'.format(self.args.save_dir, img_count))
+                    save_img(gt_img, '{}/{}_gt.png'.format(self.args.save_dir, img_count))
                     img_count+=1
 
                 comp_time += time() - end
@@ -424,7 +457,6 @@ vgg\t: {vgg:.4f}\n'.format(
                         )
                         comp_time = 0
                         load_time = 0
-
 
 
     def sync(self, loss_dict, mean=True):
@@ -444,12 +476,13 @@ vgg\t: {vgg:.4f}\n'.format(
             'session': self.args.session,
             'epoch': self.epoch + 1,
             'model': self.model.module.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
+            'optG': self.optG.state_dict(),
+            'optD': self.optD.state_dict()
         }, save_name)
         self.args.logger.info('save model: {}'.format(save_name))
 
     def load_checkpoint(self):
-        load_md_dir = '{}_{}_{}_{}'.format(self.args.model, self.args.mode, self.args.syn_type, self.args.checksession)
+        load_md_dir = '{}_{}_{}_{}'.format("RefineNet", self.args.mode, self.args.syn_type, self.args.checksession)
         if self.args.load_dir is not None:
             load_name = os.path.join(self.args.load_dir,
                                     'checkpoint',
@@ -458,18 +491,28 @@ vgg\t: {vgg:.4f}\n'.format(
             load_name = os.path.join(load_md_dir+'_{}_{}.pth'.format(self.args.checkepoch, self.args.checkpoint))
         self.args.logger.info('Loading checkpoint %s' % load_name)
         ckpt = torch.load(load_name)
-        self.model.module.load_state_dict(ckpt['model'])
-        # transfer opt params to current device
-        if self.args.split == 'train':
-            self.optimizer.load_state_dict(ckpt['optimizer'])
-            self.epoch = ckpt['epoch']
-            self.global_step = (self.epoch-1)*len(self.train_loader)
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.cuda(self.args.rank)
+        if self.args.lock_coarse:
+            model_dict = self.model.module.state_dict()
+            new_ckpt = OrderedDict()
+            for key,item in ckpt['model'].items():
+                if 'coarse' in key:
+                    new_ckpt[key] = item
+            model_dict.update(new_ckpt)
+            self.model.module.load_state_dict(model_dict)
         else:
-            assert ckpt['epoch']-1 == self.args.checkepoch, [ckpt['epoch'], self.args.checkepoch]
-            self.epoch = ckpt['epoch'] - 1
+            self.model.module.load_state_dict(ckpt['model'])
+        # transfer opt params to current device
+        if not self.args.lock_coarse:
+            if not self.args.val :
+                self.optimizer.load_state_dict(ckpt['optimizer'])
+                self.epoch = ckpt['epoch']
+                self.global_step = (self.epoch-1)*len(self.train_loader)
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.cuda(self.args.rank)
+            else :
+                assert ckpt['epoch']-1 == self.args.checkepoch, [ckpt['epoch'], self.args.checkepoch]
+                self.epoch = ckpt['epoch'] - 1
         self.args.logger.info('checkpoint loaded')
 

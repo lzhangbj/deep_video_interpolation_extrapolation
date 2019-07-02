@@ -63,15 +63,19 @@ class NLayerDiscriminator(nn.Module):
         nf = ndf
         padw = int(np.ceil((kw-1.0)/2))
         sequence = [    
-                        [nn.Conv2d(input_nc, ndf, kernel_size=3, stride=1, padding=1), norm_layer(nf), nn.LeakyReLU(0.2, True)],
-                        [nn.Conv2d(ndf, ndf, kernel_size=3, stride=1, padding=1), norm_layer(nf), nn.LeakyReLU(0.2, True)],
-                        [nn.Conv2d(ndf, ndf, kernel_size=3, stride=2, padding=1), norm_layer(nf), nn.LeakyReLU(0.2, True)],
-                        [nn.Conv2d(ndf, ndf, kernel_size=3, stride=1, padding=1), norm_layer(nf), nn.LeakyReLU(0.2, True)],
-                        [nn.Conv2d(ndf, ndf, kernel_size=3, stride=2, padding=1), norm_layer(nf), nn.LeakyReLU(0.2, True)],
-                        [nn.Conv2d(ndf, ndf, kernel_size=3, stride=1, padding=1), norm_layer(nf), nn.LeakyReLU(0.2, True)],
-                        [nn.Conv2d(ndf, 1, kernel_size=3, stride=1, padding=1)],
+                        [nn.Conv2d(input_nc, ndf, kernel_size=5, stride=1, padding=2), norm_layer(nf), nn.LeakyReLU(0.2, True)],
+                        [nn.Conv2d(ndf, ndf, kernel_size=5, stride=1, padding=2), norm_layer(ndf), nn.LeakyReLU(0.2, True)],
+                        [nn.Conv2d(ndf, 2*ndf, kernel_size=5, stride=2, padding=2), norm_layer(2*ndf), nn.LeakyReLU(0.2, True)],
+                        [nn.Conv2d(2*ndf, 2*ndf, kernel_size=5, stride=1, padding=2), norm_layer(2*ndf), nn.LeakyReLU(0.2, True)],
+                        [nn.Conv2d(2*ndf, 2*ndf, kernel_size=5, stride=2, padding=2), norm_layer(2*ndf), nn.LeakyReLU(0.2, True)],
+                        [nn.Conv2d(2*ndf, 2*ndf, kernel_size=5, stride=1, padding=2), norm_layer(2*ndf), nn.LeakyReLU(0.2, True)],
+                        [nn.Conv2d(2*ndf, 4*ndf, kernel_size=5, stride=4, padding=2), norm_layer(4*ndf), nn.LeakyReLU(0.2, True)],
+                        [nn.Conv2d(4*ndf, 4*ndf, kernel_size=5, stride=1, padding=2), norm_layer(4*ndf), nn.LeakyReLU(0.2, True)],
+                        [nn.Conv2d(4*ndf, 1, kernel_size=3, stride=1, padding=1)]
                         # [nn.Conv2d(ndf, ndf, kernel_size=3, stride=1, padding=1), nn.LeakyReLU(0.2, True)]
                     ]
+
+
 
         
 

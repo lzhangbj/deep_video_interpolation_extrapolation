@@ -12,7 +12,7 @@ from collections import OrderedDict
 import torchvision
 
 #####################################################################################################
-############################################ ssim loss ###############################################
+############################################ ssim loss ##############################################
 #####################################################################################################
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
@@ -127,14 +127,14 @@ class GDLLoss(torch.nn.Module):
     def forward(self, input, gt):
         bs, c, h, w = input.size()
 
-        w_gdl = torch.abs(input[:,:,:,1:] - input[:,:,:,:w-1])
-        h_gdl = torch.abs(input[:,:,1:,:] - input[:,:,:h-1,:])
+        w_gdl = input[:,:,:,1:] - input[:,:,:,:w-1]
+        h_gdl = input[:,:,1:,:] - input[:,:,:h-1,:]
 
-        gt_w_gdl = torch.abs(gt[:,:,:,1:] - gt[:,:,:,:w-1])
-        gt_h_gdl = torch.abs(gt[:,:,1:,:] - gt[:,:,:h-1,:])
+        gt_w_gdl = gt[:,:,:,1:] - gt[:,:,:,:w-1]
+        gt_h_gdl = gt[:,:,1:,:] - gt[:,:,:h-1,:]
         
         loss = torch.mean(torch.abs(w_gdl-gt_w_gdl)) + torch.mean(torch.abs(h_gdl-gt_h_gdl))
-        return loss
+        return loss/2
 
 
 #####################################################################################################
@@ -193,40 +193,63 @@ class VGGCosineLoss(torch.nn.Module):
         return score
 
 
-
 #####################################################################################################
 ################################################ rgb loss ###########################################
 #####################################################################################################
 class RGBLoss(torch.nn.Module):
-    def __init__(self, args, window_size = 11, size_average = True, sharp=False):
+    def __init__(self, args, window_size = 11, size_average = True, sharp=False, refine=False):
         super(RGBLoss, self).__init__()  
         self.vgg_loss = VGGLoss()
         self.gdl_loss = GDLLoss()
+        self.refine=refine
         self.ssim_loss = SSIM(window_size, size_average)
         self.l1_loss = torch.nn.L1Loss()
         if sharp:
             self.sharp_loss = SharpenessLoss()
         self.args = args
 
-    def forward(self, input, gt, normed=True, length=1):
+    def forward(self, input, gt, normed=True, length=1, refine_scale=1, step=1, res=1):
         vgg_loss = 0
         ssim_loss = 0
         for i in range(length):
+            # if res==1:
             vgg_loss += self.vgg_loss(input[:,3*i:3*(i+1)], gt[:, 3*i:3*(i+1)], normed)
             ssim_loss+=self.ssim_loss(input[:,3*i:3*(i+1)], gt[:, 3*i:3*(i+1)])
+        # if res==1:
         vgg_loss/=length
         ssim_loss/=length
         # return self.args.l1_weight*self.l1_loss(input, gt), \
         #         self.args.gdl_weight*self.gdl_loss(input, gt), \
         #         self.args.vgg_weight*vgg_loss, \
         #         self.args.ssim_weight*ssim_loss
-        return  OrderedDict( 
-                [('l1_loss', self.args.l1_weight*self.l1_loss(input, gt)), 
-                ('gdl_loss', self.args.gdl_weight*self.gdl_loss(input, gt)), 
-                ('vgg_loss', self.args.vgg_weight*vgg_loss), 
-                ('ssim_loss',self.args.ssim_weight*ssim_loss),
-                ('sharp_loss',self.args.sharp_weight*self.sharp_loss(input, gt))]
-                )
+        if not self.refine:
+            return  OrderedDict( 
+                    [('l1_loss', self.args.l1_weight*self.l1_loss(input, gt)), 
+                    ('gdl_loss', self.args.gdl_weight*self.gdl_loss(input, gt)), 
+                    ('vgg_loss', self.args.vgg_weight*vgg_loss), 
+                    ('ssim_loss',self.args.ssim_weight*ssim_loss)]
+                    # ('sharp_loss',self.args.sharp_weight*self.sharp_loss(input, gt))]
+                    )
+        else:
+            if res == 1:
+                if refine_scale==1 and step<1000 and self.args.n_scales!=1:
+                    return  OrderedDict( 
+                            [('refine_{:.2f}_l1_loss'.format(refine_scale), 0*self.l1_loss(input, gt)), 
+                            ('refine_{:.2f}_gdl_loss'.format(refine_scale), 0*self.gdl_loss(input, gt)), 
+                            ('refine_{:.2f}_vgg_loss'.format(refine_scale), 0*vgg_loss)]
+                            )              
+                else:
+                    return  OrderedDict( 
+                            [('refine_{:.2f}_l1_loss'.format(refine_scale), self.args.refine_l1_weight*self.l1_loss(input, gt)), 
+                            ('refine_{:.2f}_gdl_loss'.format(refine_scale), self.args.refine_gdl_weight*self.gdl_loss(input, gt)), 
+                            ('refine_{:.2f}_vgg_loss'.format(refine_scale), self.args.refine_vgg_weight*vgg_loss)]
+                            )
+            else:
+                return  OrderedDict( 
+                            [('refine_{:d}_l1_loss'.format(res), self.args.refine_l1_weight*self.l1_loss(input, gt)), 
+                            ('refine_{:d}_gdl_loss'.format(res), self.args.refine_gdl_weight*self.gdl_loss(input, gt)),
+                            ('refine_{:d}_vgg_loss'.format(res), self.args.refine_vgg_weight*self.gdl_loss(input, gt))]
+                            )        
 
 
 #####################################################################################################

@@ -198,6 +198,7 @@ class GANer:
                 toDraw = F.interpolate(pred_fake[i][-1][0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)
                 view_probs_fk.append(self.create_heatmap(toDraw))
             view_probs_fk.append(self.create_heatmap(F.interpolate(label_map[0].unsqueeze(0).cpu(), (128, 256), mode='bilinear', align_corners=True).squeeze(0)))
+            
             if gen_prob is not None:
                 view_probs_fk.append(self.create_heatmap(gen_prob[0].cpu()))
             write_in_img = make_grid(view_rgbs + view_segs + view_probs_gt + view_probs_fk, nrow=4)
