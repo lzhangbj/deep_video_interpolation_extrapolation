@@ -15,17 +15,15 @@ class Options():
 		self.parser.add_argument('--split', dest='split', 
 												help='whether eval after each training ', 
 												default='train',
-												choices=['train','val','test','cycgen'])
-
-		self.parser.add_argument('--val_interval', dest='val_interval',
-												help='number of epochs to evaluate',
-												type=int, 
-												default=1)
+												choices=['train','val','test','cycgen', 'mycycgen'])
 		self.parser.add_argument('--img_dir', dest='img_dir',
 												help='directory to load models', default=None,
 												type=str)
 		self.parser.add_argument('--seg_dir', dest='seg_dir',
 												help='directory to load models', default=None,
+												type=str)
+		self.parser.add_argument('--cycgen_load_dir', dest='cycgen_load_dir',
+												help='directory to load cycgen inputs', default=None,
 												type=str)
 		self.parser.add_argument('--input_h',
 										default=128,
@@ -39,10 +37,6 @@ class Options():
 												help='synthesize method',
 												choices=['inter', 'extra'],
 												default='extra') 
-		self.parser.add_argument('--vid_len', dest='vid_length', 
-												type=int,
-												default=1, 
-												help='Batch size (over multiple gpu)')
 		self.parser.add_argument('--mode', dest='mode',
 												help='mode to use',
 												choices=['xs2xs', 'xx2x'],
@@ -54,39 +48,11 @@ class Options():
 		self.parser.add_argument('--epochs', dest='epochs', 
 												type=int,
 												default=20, 
-												help='Number of training epochs')
-
-
-		# weight of losses
-		self.parser.add_argument('--l1_w', dest='l1_weight',
-												help='training optimizer loss weigh of l1',
-												type=float,
-												default=80)
-		self.parser.add_argument('--sharp_w', dest='sharp_weight',
-												help='training optimizer loss weigh of feat',
-												type=float,
-												default=0) 
-		self.parser.add_argument('--gdl_w', dest='gdl_weight',
-												help='training optimizer loss weigh of gdl',
-												type=float,
-												default=0)
-		self.parser.add_argument('--vgg_w', dest='vgg_weight',
-												help='training optimizer loss weigh of vgg',
-												type=float,
-												default=20)
-		self.parser.add_argument('--ce_w', dest='ce_weight',
-												help='training optimizer loss weigh of vgg',
-												type=float,
-												default=30)     
-		self.parser.add_argument('--ssim_w', dest='ssim_weight',
-												help='training optimizer loss weigh of feat',
-												type=float,
-												default=20)       
+												help='Number of training epochs')      
 		self.parser.add_argument('--interval', dest='interval',
 												help='training optimizer loss weigh of feat',
 												type=float,
 												default=1)      
-
 		# distributed training
 		self.parser.add_argument('--nw',  dest='num_workers', 
 												type=int, default=4,
@@ -113,15 +79,7 @@ class Options():
 		self.parser.add_argument('--save_dir', dest='save_dir',
 												help='directory to load models', default="log",
 												type=str)
-		self.parser.add_argument('--cyc_prefix', dest='cyc_prefix',
-												help='directory to load models', default="log",
-												type=str)
-		self.parser.add_argument('--imgout_dir', dest='imgout_dir',
-												help='directory to load models', default="log",
-												type=str)
-
-
-		self.parser.add_argument('--cycgen_all', dest='cycgen_all',
+		self.parser.add_argument('--one_hot_seg', dest='one_hot_seg',
 												help='whether eval after each training ', 
 												action='store_true')
 		# resume
@@ -137,7 +95,7 @@ class Options():
 
 		# resume trained model
 		self.parser.add_argument('--r', dest='resume',
-												help='whether eval after each training ', 
+												help='whether resume ', 
 												action='store_true')
 		self.parser.add_argument('--checksession', dest='checksession',
 												help='checksession to load model',
@@ -146,13 +104,13 @@ class Options():
 												help='checkepoch to load model',
 												default=1, type=int)
 		self.parser.add_argument('--checkepoch_range', dest='checkepoch_range',
-												help='whether eval after each training ', 
+												help='whether eval multiple epochs', 
 												action='store_true')
 		self.parser.add_argument('--checkepoch_low', dest='checkepoch_low',
-												help='checkepoch to load model',
+												help='when checkepoch_range is true, inclusive starting epoch',
 												default=1, type=int)    
 		self.parser.add_argument('--checkepoch_up', dest='checkepoch_up',
-												help='checkepoch to load model',
+												help='when checkepoch_range is true, inclusive ending epoch',
 												default=20, type=int)
 		self.parser.add_argument('--checkpoint', dest='checkpoint',
 												help='checkpoint to load model',
@@ -160,271 +118,387 @@ class Options():
 		self.parser.add_argument('--load_dir', dest='load_dir',
 												help='directory to load models', default="models",
 												type=str)
+		# weight of losses
+		self.parser.add_argument('--l1_w', dest='l1_weight',
+												help='training optimizer loss weigh of l1',
+												type=float,
+												default=80)
+		self.parser.add_argument('--gdl_w', dest='gdl_weight',
+												help='training optimizer loss weigh of gdl',
+												type=float,
+												default=80)
+		self.parser.add_argument('--vgg_w', dest='vgg_weight',
+												help='training optimizer loss weigh of vgg',
+												type=float,
+												default=20)
+		self.parser.add_argument('--ce_w', dest='ce_weight',
+												help='training optimizer loss weigh of vgg',
+												type=float,
+												default=30)     
+		self.parser.add_argument('--ssim_w', dest='ssim_weight',
+												help='training optimizer loss weigh of feat',
+												type=float,
+												default=20)      
+		self.parser.add_argument('--kld_w', dest='kld_weight',
+												help='training optimizer loss weigh of feat',
+												type=float,
+												default=20) 
+		self.parser.add_argument('--vid_len', dest='vid_length', 
+												type=int,
+												default=1, 
+												help='predicted video length')
 
-
-
-		self.parser.add_argument('--drop_seg', dest='drop_seg',
-												help='whether eval after each training ', 
-												action='store_true')	
-
-		self.parser.add_argument('--high_res', dest='high_res', 
-										help='model to use',
-										action='store_true')	
-		self.parser.add_argument('--re_ref', dest='re_ref', 
-										help='model to use',
-										action='store_true')	
+		self.parser.add_argument('--highres_large', dest='highres_large',
+										help='whether load coarse model ', 
+										action='store_true')
 
 		############### add subparsers ######################
 		subparsers = self.parser.add_subparsers(help='sub-command help', dest='runner')
 
-		# only generator mode
-		generator_parser = subparsers.add_parser('gen', help='use generator')
-		generator_parser.add_argument('--model', dest='model', 
-										default='MyFRRN', 
+		##############################################################################
+		############################# extrapolation subparser ########################
+		##############################################################################
+		extra_parser = subparsers.add_parser('EXTRA', help='use extrapolation')
+		extra_parser.add_argument('--model', dest='model', 
+										default='ExtraNet', 
 										help='model to use',
-										choices=['GridNet', 'MyFRRN', 'UNet','SepUNet', 'RefineNet', 'B2SNet'])  
-		generator_parser.add_argument('--coarse_model', dest='coarse_model', 
-										default='MyFRRN', 
+										choices=['ExtraNet', 'ExtraInpaintNet'])  
+		extra_parser.add_argument('--load_model', dest='load_model', 
+										default='ExtraNet', 
 										help='model to use',
-										choices=['GridNet', 'MyFRRN', 'UNet','SepUNet'])  					  
-		generator_parser.add_argument('--o', dest='optimizer', 
-										help='training optimizer',
+										choices=['ExtraNet', 'ExtraInpaintNet'])  
+
+		### coarse model settings ###
+		extra_parser.add_argument('--coarse_model', dest='coarse_model', 
+										default='HRNet', 
+										help='model to use',
+										choices=['HRNet'])  					  
+		extra_parser.add_argument('--coarse_o', dest='coarse_optimizer', 
+										help='training coarse optimizer',
 										choices =['adamax','adam', 'sgd'], 
 										default="adamax")
-		generator_parser.add_argument('--learning_rate', dest='learning_rate', 
-										help='starting learning rate',
-										default=0.001, type=float)
+		extra_parser.add_argument('--coarse_lr', dest='coarse_learning_rate', 
+										help='coarse learning rate',
+										default=0.001, type=float)	
+		extra_parser.add_argument('--load_coarse', dest='load_coarse',
+												help='whether load coarse model ', 
+												action='store_true')
+		extra_parser.add_argument('--train_coarse', dest='train_coarse',
+												help='whether train coarse model ', 
+												action='store_true')
 
-		generator_parser.add_argument('--n_sc', dest='n_scales', 
-										help='starting learning rate',
-										default=2, type=int)
-
-		# only generator mode
-		refine_parser = subparsers.add_parser('refine', help='use generator')
-		refine_parser.add_argument('--model', dest='model', 
-										default='RefineNet', 
-										help='model to use',
-										choices=['RefineNet'])  
-		refine_parser.add_argument('--coarse_model', dest='coarse_model', 
-										default='MyFRRN', 
-										help='model to use',
-										choices=['GridNet', 'MyFRRN', 'UNet','SepUNet'])  
-		refine_parser.add_argument('--refine_model', dest='refine_model', 
-										default='SRN', 
-										help='model to use',
-										choices=['SRN', 'SRN2', 'SRN3', 'SRN4', 'SRN4Seg', 'SRN4Sharp',  'AttnRefine', 'AttnBaseRefine', 'MSBaseRefine'])	
-		refine_parser.add_argument('--high_res_model', dest='high_res_model', 
-										default='HResUnet', 
-										help='model to use',
-										choices=['HResUnet'])			
-		refine_parser.add_argument('--re_ref_model', dest='re_ref_model', 
-										default='AttnRefineV2', 
-										help='model to use',
-										choices=['AttnRefineV2'])		
-		refine_parser.add_argument('--lock_coarse', dest='lock_coarse', 
-										help='model to use',
-										action='store_true')		
-		refine_parser.add_argument('--pretrained_low', dest='pretrained_low', 
-										help='model to use',
-										action='store_true')	
-		refine_parser.add_argument('--lock_low', dest='lock_low', 
-										help='model to use',
-										action='store_true')		
-		refine_parser.add_argument('--lock_retrain', dest='lock_retrain', 
-										help='model to use',
-										action='store_true')	
-		refine_parser.add_argument('--pretrained_coarse', dest='pretrained_coarse', 
-										help='model to use',
+		### inpaint model settings ###
+		extra_parser.add_argument('--inpaint', dest='inpaint', 
+										help='whether inpaint or not',
 										action='store_true')
-		refine_parser.add_argument('--o', dest='optimizer', 
-										help='training optimizer',
+		extra_parser.add_argument('--inpaint_mask', dest='inpaint_mask', 
+										help='whether inpaint mask or not',
+										action='store_true')	  
+		extra_parser.add_argument('--inpaint_model', dest='inpaint_model', 
+										default='InpaintUnet', 
+										help='inpaint model to use',
+										choices=['InpaintUnet'])  					  
+		extra_parser.add_argument('--inpaint_o', dest='inpaint_optimizer', 
+										help='training inpaint optimizer',
 										choices =['adamax','adam', 'sgd'], 
 										default="adamax")
-		refine_parser.add_argument('--learning_rate', dest='learning_rate', 
-										help='starting learning rate',
-										default=0.001, type=float)
-		refine_parser.add_argument('--n_sc', dest='n_scales', 
-										help='starting learning rate',
-										default=2, type=int)
+		extra_parser.add_argument('--inpaint_lr', dest='inpaint_learning_rate', 
+										help='inpaint learning rate',
+										default=0.001, type=float)	
+		extra_parser.add_argument('--load_inpaint', dest='load_inpaint',
+												help='whether load inpaint model ', 
+												action='store_true')	
+		extra_parser.add_argument('--train_inpaint', dest='train_inpaint',
+												help='whether train inpaint model ', 
+												action='store_true')	
+		extra_parser.add_argument('--num_pred_once', dest='num_pred_once',
+												help='#frames extrapolated for each model output', default=1,
+												type=int)
+		extra_parser.add_argument('--num_pred_step', dest='num_pred_step',
+												help='#steps extrapolated', default=1,
+												type=int)
+		extra_parser.add_argument('--fix_init_frames', dest='fix_init_frames',
+												help='wheter add start frames always', 
+												action='store_true')
+
+
+		##############################################################################
+		############################ interpolation subparser #########################
+		##############################################################################
+		inter_parser = subparsers.add_parser('INTER', help='use extrapolation')
+		inter_parser.add_argument('--model', dest='model', 
+										default='InterNet', 
+										help='model to use',
+										choices=['InterNet', 'InterRefineNet', 'InterStage3Net', 'InterGANNet'])  
+		inter_parser.add_argument('--load_model', dest='load_model', 
+										default='InterNet', 
+										help='model to use',
+										choices=['InterNet', 'InterRefineNet', 'InterStage3Net', 'InterGANNet'])  
+		inter_parser.add_argument('--n_sc', dest='n_scales', 
+										help='scales of output',
+										default=1, type=int)	
+
+
+		inter_parser.add_argument('--gan', dest='gan',
+												help='whether load coarse model ', 
+												action='store_true')
+
+		### coarse model settings ###
+		inter_parser.add_argument('--coarse_model', dest='coarse_model', 
+										default='HRNet', 
+										help='model to use',
+										choices=['HRNet', 'VAEHRNet'])  					  
+		inter_parser.add_argument('--coarse_o', dest='coarse_optimizer', 
+										help='training coarse optimizer',
+										choices =['adamax','adam', 'sgd'], 
+										default="adamax")
+		inter_parser.add_argument('--coarse_lr', dest='coarse_learning_rate', 
+										help='coarse learning rate',
+										default=0.001, type=float)	
+		inter_parser.add_argument('--highres_large', dest='highres_large',
+												help='whether load coarse model ', 
+												action='store_true')
+		inter_parser.add_argument('--load_coarse', dest='load_coarse',
+												help='whether load coarse model ', 
+												action='store_true')
+		inter_parser.add_argument('--train_coarse', dest='train_coarse',
+												help='whether train coarse model ', 
+												action='store_true')
+		inter_parser.add_argument('--vae', dest='vae',
+												help='whether train coarse model ', 
+												action='store_true')
+
+		inter_parser.add_argument('--seg_disc', dest='seg_disc',
+												help='whether train coarse model ', 
+												action='store_true')
+
+		### refine model settings ###
+		inter_parser.add_argument('--refine', dest='refine', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--with_gt_seg', dest='with_gt_seg', 
+										help='whether refine',
+										action='store_true')
+		inter_parser.add_argument('--refine_model', dest='refine_model', 
+										default='refineUnet', 
+										help='refine model to use',
+										choices=['refineUnet', 'SRNRefine'])  					  
+		inter_parser.add_argument('--refine_o', dest='refine_optimizer', 
+										help='training refine optimizer',
+										choices =['adamax','adam', 'sgd'], 
+										default="adamax")
+		inter_parser.add_argument('--refine_lr', dest='refine_learning_rate', 
+										help='refine learning rate',
+										default=0.001, type=float)	
+		inter_parser.add_argument('--load_refine', dest='load_refine',
+												help='whether load refine model ', 
+												action='store_true')	
+		inter_parser.add_argument('--train_refine', dest='train_refine',
+												help='whether train refine model ', 
+												action='store_true')
 		# weight of losses
-		refine_parser.add_argument('--r_l1_w', dest='refine_l1_weight',
+		inter_parser.add_argument('--refine_l1_w', dest='refine_l1_weight',
 												help='training optimizer loss weigh of l1',
 												type=float,
-												default=20)
-		refine_parser.add_argument('--r_vgg_w', dest='refine_vgg_weight',
+												default=80)
+		inter_parser.add_argument('--refine_gdl_w', dest='refine_gdl_weight',
+												help='training optimizer loss weigh of gdl',
+												type=float,
+												default=80)
+		inter_parser.add_argument('--refine_vgg_w', dest='refine_vgg_weight',
 												help='training optimizer loss weigh of vgg',
 												type=float,
-												default=5)   
-		refine_parser.add_argument('--r_ssim_w', dest='refine_ssim_weight',
+												default=20)   
+		inter_parser.add_argument('--refine_ssim_w', dest='refine_ssim_weight',
 												help='training optimizer loss weigh of feat',
-												type=float,
-												default=5) 
-		refine_parser.add_argument('--r_gdl_w', dest='refine_gdl_weight',
-												help='training optimizer loss weigh of feat',
-												type=float,
-												default=20)
-		# seperate coarse model from refine
-		refine_parser.add_argument('--sep_coarse', dest='seperate_coarse', 
-										help='model to use',
-										action='store_true')
-		refine_parser.add_argument('--c_checksession', dest='coarse_checksession',
-												help='checksession to load model',
-												default=1, type=int)
-		refine_parser.add_argument('--c_checkepoch', dest='coarse_checkepoch',
-												help='checkepoch to load model',
-												default=1, type=int)  
-		refine_parser.add_argument('--c_checkpoint', dest='coarse_checkpoint',
-												help='checkpoint to load model',
-												default=0, type=int)
-		refine_parser.add_argument('--c_load_dir', dest='coarse_load_dir',
-												help='directory to load models', default="models",
-												type=str)
-		refine_parser.add_argument('--c_mode', dest='coarse_mode',
-												help='mode to use',
-												choices=['xs2xs', 'xx2x'],
-												default='xs2xs')
-
-
-		# only generator mode
-		refine_gan_parser = subparsers.add_parser('refine_gan', help='use generator')
-		refine_gan_parser.add_argument('--model', dest='model', 
-										default='RefineGAN', 
-										help='model to use',
-										choices=['RefineGAN'])  
-		refine_gan_parser.add_argument('--coarse_model', dest='coarse_model', 
-										default='MyFRRN', 
-										help='model to use',
-										choices=['GridNet', 'MyFRRN', 'UNet','SepUNet'])  
-		refine_gan_parser.add_argument('--refine_model', dest='refine_model', 
-										default='SRN', 
-										help='model to use',
-										choices=['SRN', 'SRN2', 'SRN3', 'SRN4'])		
-		refine_gan_parser.add_argument('--lock_coarse', dest='lock_coarse', 
-										help='model to use',
-										action='store_true')			  
-		refine_gan_parser.add_argument('--o', dest='optimizer', 
-										help='training optimizer',
-										choices =['adamax','adam', 'sgd'], 
-										default="adamax")
-		refine_gan_parser.add_argument('--learning_rate', dest='learning_rate', 
-										help='starting learning rate',
-										default=0.001, type=float)
-		refine_gan_parser.add_argument('--n_sc', dest='n_scales', 
-										help='starting learning rate',
-										default=2, type=int)
-		# weight of losses
-		refine_gan_parser.add_argument('--r_l1_w', dest='refine_l1_weight',
-												help='training optimizer loss weigh of l1',
 												type=float,
 												default=20) 
-		refine_gan_parser.add_argument('--r_vgg_w', dest='refine_vgg_weight',
-												help='training optimizer loss weigh of vgg',
-												type=float,
-												default=5)   
-		refine_gan_parser.add_argument('--r_ssim_w', dest='refine_ssim_weight',
-												help='training optimizer loss weigh of feat',
-												type=float,
-												default=5)   
-		refine_gan_parser.add_argument('--adv_w', dest='refine_adv_weight',
-												help='training optimizer loss weigh of feat',
-												type=float,
-												default=0.02) 
-		refine_gan_parser.add_argument('--d_w', dest='refine_d_weight',
-												help='training optimizer loss weigh of feat',
-												type=float,
-												default=1) 
-		refine_gan_parser.add_argument('--numD', dest='num_D', 
-										default=2, 
-										help='number of discriminator',
-										type=int)
 
-		# gan mode
-		gan_parser = subparsers.add_parser('gan', help='use gan')
-		gan_parser.add_argument('--model', dest='model', 
-										default='GAN', 
-										help='model to use',
-										choices=['GAN'])  
-		gan_parser.add_argument('--netG', dest='netG', 
-										default='MyFRRN', 
-										help='model to use',
-										choices=['GridNet', 'MyFRRN'])  
-		gan_parser.add_argument('--netD', dest='netD', 
-										default='multi_scale', 
-										help='model to use',
-										choices=['multi_scale','multi_scale_img', 'multi_scale_img_seg','motion_img','motion_img_seg'])
-		gan_parser.add_argument('--numD', dest='num_D', 
-										default=3, 
-										help='number of discriminator',
-										type=int)
-		gan_parser.add_argument('--n_layer_D', dest='n_layer_D', 
-										default=2, 
-										help='number of discriminator layers',
-										type=int)
-		gan_parser.add_argument('--oG', dest='optG', 
-										help='training optimizer',
+		### stage3 model ###
+		inter_parser.add_argument('--stage3', dest='stage3', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--train_stage3', dest='train_stage3', 
+										help='whether refine or not',
+										action='store_true') 
+		inter_parser.add_argument('--load_stage3', dest='load_stage3', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--stage3_model', dest='stage3_model', 
+										default='MSResAttnRefine', 
+										help='refine model to use',
+										choices=['MSResAttnRefine', 'MSResAttnRefineV2','MSResAttnRefineV2Base','MSResAttnRefineV3'])
+		inter_parser.add_argument('--stage3_prop', dest='stage3_prop', 
+										help='whether refine or not',
+										action='store_true') 
+		inter_parser.add_argument('--stage3_flow_consist_w', dest='stage3_flow_consist_weight', 
+										help='whether refine or not',
+										type=float,
+										default=0)
+
+
+		inter_parser.add_argument('--local_disc', dest='local_disc', 
+										help='whether refine or not',
+										action='store_true') 
+
+		### frame_disc model ###
+		inter_parser.add_argument('--frame_disc', dest='frame_disc', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--frame_disc_o', dest='frame_disc_optimizer', 
+										help='training refine optimizer',
 										choices =['adamax','adam', 'sgd'], 
 										default="adamax")
-		gan_parser.add_argument('--oD', dest='optD', 
-										help='training optimizer',
-										choices =['adamax','adam', 'sgd'], 
-										default="sgd")
-		gan_parser.add_argument('--lrG', dest='lr_G', 
-										help='starting learning rate',
+		inter_parser.add_argument('--frame_disc_lr', dest='frame_disc_learning_rate', 
+										help='refine learning rate',
 										default=0.001, type=float)
-		gan_parser.add_argument('--lrD', dest='lr_D', 
-										help='starting learning rate',
-										default=0.001, type=float)
-		gan_parser.add_argument('--adv_w', dest='adv_weight',
-										help='training optimizer loss weigh of gdl',
+		inter_parser.add_argument('--train_frame_disc', dest='train_frame_disc', 
+										help='whether refine or not',
+										action='store_true') 
+		inter_parser.add_argument('--load_frame_disc', dest='load_frame_disc', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--load_frame_disc_model', dest='load_frame_disc_model', 
+										default='FrameDiscriminator', 
+										help='refine model to use',
+										choices=['FrameDiscriminator', 'FrameLocalDiscriminator', 
+												'FrameSNDiscriminator', 'FrameSNLocalDiscriminator', 
+												'FrameDetDiscriminator', 'FrameSNDetDiscriminator'])  
+		inter_parser.add_argument('--frame_disc_model', dest='frame_disc_model', 
+										default='FrameDiscriminator', 
+										help='refine model to use',
+										choices=['FrameDiscriminator', 'FrameLocalDiscriminator', 
+												'FrameSNDiscriminator', 'FrameSNLocalDiscriminator', 
+												'FrameDetDiscriminator', 'FrameSNDetDiscriminator'])
+		inter_parser.add_argument('--frame_disc_d_w', dest='frame_disc_disc_weight', 
+										help='whether refine or not',
+										type=float,
+										default=1) 
+		inter_parser.add_argument('--frame_disc_g_w', dest='frame_disc_gen_weight', 
+										help='whether refine or not',
 										type=float,
 										default=1)
-		gan_parser.add_argument('--adv_feat_w', dest='adv_feat_weight',
-										help='training optimizer loss weigh of gdl',
-										type=float,
-										default=1)
-		gan_parser.add_argument('--d_w', dest='d_weight',
-										help='training optimizer loss weigh of gdl',
-										type=float,
-										default=10)
-		gan_parser.add_argument('--load_G', dest='load_G',
-										help='training optimizer loss weigh of gdl',
-										action='store_true')
-		gan_parser.add_argument('--load_GANG', dest='load_GANG',
-										help='training optimizer loss weigh of gdl',
-										action='store_true')
-
-
-		# only generator mode
-		vae_parser = subparsers.add_parser('vae', help='use generator')
-		vae_parser.add_argument('--model', dest='model', 
-										default='VAE', 
-										help='model to use',
-										choices=['GridNet', 'MyFRRN', 'VAE','VAE_S'])  
-		vae_parser.add_argument('--o', dest='optimizer', 
-										help='training optimizer',
+		### frame_det_disc model ###
+		inter_parser.add_argument('--frame_det_disc', dest='frame_det_disc', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--frame_det_disc_o', dest='frame_det_disc_optimizer', 
+										help='training refine optimizer',
 										choices =['adamax','adam', 'sgd'], 
 										default="adamax")
-		vae_parser.add_argument('--learning_rate', dest='learning_rate', 
-										help='starting learning rate',
+		inter_parser.add_argument('--frame_det_disc_lr', dest='frame_det_disc_learning_rate', 
+										help='refine learning rate',
 										default=0.001, type=float)
-		vae_parser.add_argument('--input_size',
-										default=(128, 128),
-										type=tuple,
-										help='input image size')
-		vae_parser.add_argument('--latent_dim',
-										default=512,
-										type=int,
-										help='input image size')
-		vae_parser.add_argument('--seg_dim',
-										default=4,
-										type=int,
-										help='input image size')
-		vae_parser.add_argument('--seg',
-										action='store_true',
-										help='input image size')
-		vae_parser.add_argument('--disparity',
-										action='store_true',
-										help='input image size')
+		inter_parser.add_argument('--train_frame_det_disc', dest='train_frame_det_disc', 
+										help='whether refine or not',
+										action='store_true') 
+		inter_parser.add_argument('--load_frame_det_disc', dest='load_frame_det_disc', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--load_frame_det_disc_model', dest='load_frame_det_disc_model', 
+										default='FrameDiscriminator', 
+										help='refine model to use',
+										choices=['FrameDiscriminator', 'FrameLocalDiscriminator', 
+												'FrameSNDiscriminator', 'FrameSNLocalDiscriminator', 
+												'FrameDetDiscriminator', 'FrameSNDetDiscriminator'])  
+		inter_parser.add_argument('--frame_det_disc_model', dest='frame_det_disc_model', 
+										default='FrameDiscriminator', 
+										help='refine model to use',
+										choices=['FrameDiscriminator', 'FrameLocalDiscriminator', 
+												'FrameSNDiscriminator', 'FrameSNLocalDiscriminator', 
+												'FrameDetDiscriminator', 'FrameSNDetDiscriminator'])
+		inter_parser.add_argument('--frame_det_disc_d_w', dest='frame_det_disc_disc_weight', 
+										help='whether refine or not',
+										type=float,
+										default=1) 
+		inter_parser.add_argument('--frame_det_disc_g_w', dest='frame_det_disc_gen_weight', 
+										help='whether refine or not',
+										type=float,
+										default=1) 
+
+
+		### video_disc model ###
+		inter_parser.add_argument('--video_disc', dest='video_disc', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--video_disc_o', dest='video_disc_optimizer', 
+										help='training refine optimizer',
+										choices =['adamax','adam', 'sgd'], 
+										default="adamax")
+		inter_parser.add_argument('--video_disc_lr', dest='video_disc_learning_rate', 
+										help='refine learning rate',
+										default=0.001, type=float)
+		inter_parser.add_argument('--train_video_disc', dest='train_video_disc', 
+										help='whether refine or not',
+										action='store_true') 
+		inter_parser.add_argument('--load_video_disc', dest='load_video_disc', 
+										help='whether refine or not',
+										action='store_true')   
+		inter_parser.add_argument('--load_video_disc_model', dest='load_video_disc_model', 
+										default='VideoDiscriminator', 
+										help='refine model to use',
+										choices=['VideoDiscriminator', 'VideoLocalDiscriminator', 
+												'VideoSNDiscriminator', 'VideoSNLocalDiscriminator', 
+												'VideoDetDiscriminator','VideoSNDetDiscriminator',
+												'VideoLSSNDetDiscriminator'])  
+		inter_parser.add_argument('--video_disc_model', dest='video_disc_model', 
+										default='VideoDiscriminator', 
+										help='refine model to use',
+										choices=['VideoDiscriminator','VideoLocalDiscriminator', 
+												'VideoSNDiscriminator', 'VideoSNLocalDiscriminator',
+												'VideoDetDiscriminator','VideoSNDetDiscriminator', 
+												'VideoLSSNDetDiscriminator'])
+		inter_parser.add_argument('--video_disc_d_w', dest='video_disc_disc_weight', 
+										help='whether refine or not',
+										type=float,
+										default=1) 
+		inter_parser.add_argument('--video_disc_g_w', dest='video_disc_gen_weight', 
+										help='whether refine or not',
+										type=float,
+										default=1) 
+
+		### video_det_disc model ###
+		inter_parser.add_argument('--video_det_disc', dest='video_det_disc', 
+										help='whether refine or not',
+										action='store_true')  
+		inter_parser.add_argument('--video_det_disc_o', dest='video_det_disc_optimizer', 
+										help='training refine optimizer',
+										choices =['adamax','adam', 'sgd'], 
+										default="adamax")
+		inter_parser.add_argument('--video_det_disc_lr', dest='video_det_disc_learning_rate', 
+										help='refine learning rate',
+										default=0.001, type=float)
+		inter_parser.add_argument('--train_video_det_disc', dest='train_video_det_disc', 
+										help='whether refine or not',
+										action='store_true') 
+		inter_parser.add_argument('--load_video_det_disc', dest='load_video_det_disc', 
+										help='whether refine or not',
+										action='store_true')   
+		inter_parser.add_argument('--load_video_det_disc_model', dest='load_video_det_disc_model', 
+										default='VideoDiscriminator', 
+										help='refine model to use',
+										choices=['VideoDiscriminator', 'VideoLocalDiscriminator', 
+												'VideoSNDiscriminator', 'VideoSNLocalDiscriminator', 
+												'VideoDetDiscriminator','VideoSNDetDiscriminator',
+												'VideoLSSNDetDiscriminator'])  
+		inter_parser.add_argument('--video_det_disc_model', dest='video_det_disc_model', 
+										default='VideoDiscriminator', 
+										help='refine model to use',
+										choices=['VideoDiscriminator','VideoLocalDiscriminator', 
+												'VideoSNDiscriminator', 'VideoSNLocalDiscriminator',
+												'VideoDetDiscriminator','VideoSNDetDiscriminator', 
+												'VideoLSSNDetDiscriminator'])
+		inter_parser.add_argument('--video_det_disc_d_w', dest='video_det_disc_disc_weight', 
+										help='whether refine or not',
+										type=float,
+										default=1) 
+		inter_parser.add_argument('--video_det_disc_g_w', dest='video_det_disc_gen_weight', 
+										help='whether refine or not',
+										type=float,
+										default=1) 
+
+
+
 		self.initialized = True
 
 

@@ -12,6 +12,7 @@ import pickle
 import numpy as np
 from torch.autograd import Variable
 import torch
+import cv2
 import torch.nn as nn
 import torch.distributed as dist 
 import torch.nn.functional as F
@@ -26,7 +27,7 @@ import nets
 # from flow_process import imgs2vid
 
 from data import get_dataset
-from folder import rgb_load
+from folder import rgb_load, seg_load
 from utils.net_utils import *
 
 def get_model(args):
@@ -50,12 +51,12 @@ class Refiner:
 		if self.args.lock_coarse or self.args.lock_retrain or self.args.lock_low:
 			for p in self.model.coarse_model.parameters():
 				p.requires_grad = False
-		if self.args.lock_low:
+		if self.args.lock_low or self.args.lock_refine:
 			for p in self.model.refine_model.parameters():
 				p.requires_grad = False
 		coarse_params_cnt = count_parameters(self.model.coarse_model)
-		refine_params_cnt = count_parameters(self.model.refine_model)
 		print("coarse params ", coarse_params_cnt)
+		refine_params_cnt = count_parameters(self.model.refine_model)
 		print("refine params ", refine_params_cnt)
 		if self.args.re_ref:
 			re_ref_params_cnt = count_parameters(self.model.re_ref_model)
@@ -64,7 +65,7 @@ class Refiner:
 		self.model.cuda(args.rank)
 		self.model = torch.nn.parallel.DistributedDataParallel(self.model,
 				device_ids=[args.rank])
-		if self.args.split != 'cycgen':
+		if self.args.split not in ['cycgen', 'mycycgen']:
 			train_dataset, val_dataset = get_dataset(args)
 
 		if args.split == 'train':
@@ -119,19 +120,14 @@ class Refiner:
 			self.load_checkpoint()
 
 		if args.rank == 0:
-			# if args.split:
-			# 	self.writer =  SummaryWriter(args.path+'/val_int_{}_logs'.format(self.args.interval)) if self.args.dataset=='cityscape' else \
-			# 							SummaryWriter(args.path+'/{}_val_int_1_logs'.format(self.args.dataset))
-			# 	# SummaryWriter(args.path+'/val_logs') if args.interval == 2 else\
-								
-
-			# else:
-			# 	self.writer = SummaryWriter(args.path+'/logs')
-			writer_name = args.path+'/{}_int_{}_{}_logs'.format(self.args.split, self.args.interval, self.args.dataset)
+			writer_name = args.path+'/{}_int_{}_len_{}_{}_logs'.format(self.args.split, self.args.interval, self.args.vid_length, self.args.dataset)
 			self.writer = SummaryWriter(writer_name)
 
-		self.base_flow_map = self.standard_flow_map()
-		self.base_flow_map = F.interpolate(torch.tensor(self.base_flow_map).permute(0,3,1,2), size=(128, 256), mode='bilinear', align_corners=True)[0]
+		if self.args.re_ref:
+			self.base_flow_map = self.standard_flow_map().unsqueeze(0)
+			self.base_flow_map = F.interpolate(self.base_flow_map, size=(128, 256), mode='bilinear', align_corners=True)[0]
+
+		self.stand_heat_map = self.create_stand_heatmap()
 
 	def set_epoch(self, epoch):
 		self.args.logger.info("Start of epoch %d" % (epoch+1))
@@ -140,59 +136,125 @@ class Refiner:
 		# self.val_loader.sampler.set_epoch(epoch)
 
 	def get_input(self, data):
-		# assert self.args.mode == 'xs2xs'
-		# if not self.args.high_res:
-		#   if self.args.syn_type == 'extra':
-		#       x = torch.cat([data['frame1'], data['frame2'], data['seg1'], data['seg2']], dim=1)
-		#       mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1)
-		#       gt = torch.cat([data['frame3'], data['seg3']], dim=1)
-		#   else:
-		#       x = torch.cat([data['frame1'], data['frame3'], data['seg1'], data['seg3']], dim=1)
-		#       mask = torch.cat([data['fg_mask1'],data['fg_mask3']], dim=1)
-		#       gt = torch.cat([data['frame2'], data['seg2']], dim=1)   
-		#   return x, mask, gt     
-		# else:
 		if self.args.syn_type == 'extra':
-			x = torch.cat([data['frame1'], data['frame2']], dim=1)
-			seg = torch.cat([data['seg1'], data['seg2']], dim=1) if self.args.mode == 'xs2xs' else None
-			mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1) if self.args.mode == 'xs2xs' else None
-			gt_x = data['frame3']
-			gt_seg = data['seg3'] if self.args.mode == 'xs2xs' else None
+			if self.args.fix_init_frames:
+				x = torch.cat([data['frame1'], data['frame2']], dim=1)
+				seg = torch.cat([data['seg1'], data['seg2']], dim=1) if self.args.mode == 'xs2xs' else None
+				mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1) if self.args.mode == 'xs2xs' else None
+				gt_x = [ data['frame'+str(i+3)] for i in range(self.args.pred_len) ]
+				gt_seg = [ data['seg'+str(i+3)] if self.args.mode == 'xs2xs' else None for i in range(self.args.pred_len) ]
+			else:
+				x = torch.cat([data['frame1'], data['frame2']], dim=1)
+				seg = torch.cat([data['seg1'], data['seg2']], dim=1) if self.args.mode == 'xs2xs' else None
+				mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1) if self.args.mode == 'xs2xs' else None
+				gt_x = data['frame3']
+				gt_seg = data['seg3'] if self.args.mode == 'xs2xs' else None
 		else:
 			x = torch.cat([data['frame1'], data['frame3']], dim=1)
 			seg = torch.cat([data['seg1'], data['seg3']], dim=1) if self.args.mode == 'xs2xs' else None
 			mask = torch.cat([data['fg_mask1'],data['fg_mask3']], dim=1) if self.args.mode == 'xs2xs' else None
 			gt_x = data['frame2'] 
 			gt_seg = data['seg2']  if self.args.mode == 'xs2xs' else None
-		return x, seg, mask, gt_x, gt_seg       
+		return x, seg, mask, gt_x, gt_seg  
+
+	def get_inputs(self, data):
+		assert self.args.syn_type == 'extra'
+		x = torch.cat([data['frame1'], data['frame2']], dim=1)
+		seg = torch.cat([data['seg1'], data['seg2']], dim=1) if self.args.mode == 'xs2xs' else None
+		mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1) if self.args.mode == 'xs2xs' else None
+		gt_x = [ data['frame'+str(i+3)] for i in range(self.args.vid_length) ]
+		gt_seg = [ data['seg'+str(i+3)] if self.args.mode == 'xs2xs' else None for i in range(self.args.vid_length) ]
+		return x, seg, mask, gt_x, gt_seg
 
 	def normalize(self, img):
 		return (img+1)/2
 
 	def standard_flow_map(self):
-		offset = torch.zeros(1,2,16,32)
-		h_unit = 16//5
-		w_unit = 32//9
-		for i in range(5):
-			offset[:,1,i*h_unit:min((i+1)*h_unit, 16), :] = i
-		for i in range(9):
-			offset[:,0,:, i*w_unit:min((i+1)*w_unit, 32)] = i
+		W = self.model.module.re_ref_model.W
+		H = self.model.module.re_ref_model.H
+		w = self.model.module.re_ref_model.w
+		h = self.model.module.re_ref_model.h
 
+		offset = torch.zeros(1,2,H,W)
+		h_unit = H//h # 3
+		w_unit = W//w # 3
+		for i in range(h):
+			offset[:,1,i*h_unit:min((i+1)*h_unit, H), :] = i
+		for i in range(w):
+			offset[:,0,:, i*w_unit:min((i+1)*w_unit, W)] = i
 
-		# offset[:,0,:10, :] = 0
-		# offset[:,0,10:20, :] = 1
-		# offset[:,0,20:32, :] = 2
-		# offset[:,1,:, :20] = 0
-		# offset[:,1,:, 20:40] = 1
-		# offset[:,1,:, 40:64] = 2
-		# h_add = torch.arange(32).view(1, 1, 32, 1).expand(1, 1, -1, 64).float()
-		# w_add = torch.arange(64).view(1, 1, 1, 64).expand(1, 1, 32, -1).float()
-		h_w_add = torch.zeros(1, 2, 16, 32)
-		h_w_add[:, 0] = 4
-		h_w_add[:, 1] = 2
+		h_w_add = torch.zeros(1, 2, H, W)
+		h_w_add[:, 0] = w//2
+		h_w_add[:, 1] = h//2
 		offset = offset - h_w_add
-		flow_map = flow_to_image(flow=offset.permute(0,2,3,1).contiguous().numpy())
+
+		flow_map = self.flow_to_image(flow=offset[0])
 		return flow_map
+
+	def flow_to_image(self, flow):
+		c, h, w = flow.size()
+		flow_np = flow.permute(1,2,0).contiguous().numpy()
+		hsv = np.zeros((h, w, 3), dtype=np.uint8)
+		hsv[..., 1] = 255
+
+		mag, ang = cv2.cartToPolar(flow_np[..., 0], flow_np[..., 1])
+		hsv[..., 0] = ang * 180 / np.pi / 2
+		hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+		bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+		bgr = bgr.astype(np.float32)/255
+		return torch.tensor(bgr).permute(2,0,1).contiguous()
+
+	def create_stand_heatmap(self):
+		heatmap = torch.zeros(3, 128, 256)
+		for i in range(256):
+			heatmap[0, :, i] = max(0, 1 - 2.*i/256)
+			heatmap[1, :, i] = max(0, 2.*i/256 - 1)
+			heatmap[2, :, i] = 1-heatmap[0, :, i]-heatmap[1, :, i]
+		return heatmap
+
+	def create_heatmap(self, prob_map):
+		c, h, w = prob_map.size()
+		assert c==1, c
+		assert h==128, h
+		rgb_prob_map = torch.zeros(3, h, w)
+		minimum, maximum = 0.0, 1.0
+		ratio = 2 * (prob_map-minimum) / (maximum - minimum)
+
+		rgb_prob_map[0] = 1-ratio
+		rgb_prob_map[1] = ratio-1
+		rgb_prob_map[:2].clamp_(0,1)
+		rgb_prob_map[2] = 1-rgb_prob_map[0]-rgb_prob_map[1]
+		return rgb_prob_map
+
+	def prepare_extra_image_set(self, data, imgs, segs, masks=None, inpaints=None):
+		assert len(imgs) == self.args.num_pred_step*self.args.num_pred_once
+		num_pred_imgs = self.args.num_pred_step*self.args.num_pred_once
+		view_gt_rgbs = [ self.normalize(data['frame'+str(i+1)][0]) for i in range(num_pred_imgs+2)]
+		view_gt_segs = [ vis_seg_mask(data['seg'+str(i+1)][0].unsqueeze(0), 20).squeeze(0) for i in range(num_pred_imgs+2)]
+
+		black_img = torch.zeros_like(view_gt_rgbs[0])
+
+		view_pred_imgs =  [black_img]*2
+		view_pred_imgs += [self.normalize(img[0]) for img in imgs]
+
+		view_pred_segs =  [black_img]*2
+		view_pred_segs += [vis_seg_mask(seg[0].unsqueeze(0), 20).squeeze(0) for seg in segs]
+
+		view_imgs = view_gt_rgbs + view_pred_imgs + view_gt_segs + view_pred_segs
+
+		if self.args.inpaint:
+			view_inpaint_imgs =  [black_img]*2
+			view_inpaint_imgs += [self.normalize(img[0]) for img in inpaints]
+
+			view_inpaint_masks =  [black_img, self.stand_heat_map]
+			view_inpaint_masks += [ self.create_heatmap(img[0]) for img in masks]
+
+			view_imgs+=view_inpaint_imgs
+			view_imgs+=view_inpaint_masks
+
+		write_in_img = make_grid(view_imgs, nrow=num_pred_imgs+2)
+
+		return write_in_img
 
 	def prepare_image_set(self, data, coarse_img, refined_imgs, seg, high_res_img=None, re_ref_img=None, flow=None):
 		if self.args.dataset != 'vimeo':
@@ -217,64 +279,121 @@ class Refiner:
 		if self.args.mode=='xs2xs':
 			pred_seg = vis_seg_mask(seg[0].unsqueeze(0), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
 			view_segs.insert(insert_index, pred_seg)
-		# refine
-		refined_bs_imgs = [ refined_img[0].unsqueeze(0) for refined_img in refined_imgs ] 
-		# for i in range(self.args.n_scales):
-		insert_img = F.interpolate(refined_bs_imgs[-1], size=re_size)[0].clamp_(-1, 1) 
-
-		pred_rgb = self.normalize(insert_img)
 		insert_ind = insert_index + 1
-		view_rgbs.insert(insert_ind, pred_rgb)
-
 
 		view_imgs = view_rgbs 
 		if self.args.mode=='xs2xs':
 			view_imgs = view_imgs + view_segs
-		
 
-		if self.args.high_res:   
-			view_imgs = view_rgbs[:2] + [ self.normalize(high_res_img[0].clamp_(-1,1))] + [view_rgbs[-1]] + \
-						[black_img] + [F.interpolate(self.normalize(data['frame2'][0].unsqueeze(0)), scale_factor=0.5, mode='bilinear', align_corners=True)[0]] + view_rgbs[2:4] 
-
-			if self.args.mode=='xs2xs':
-				view_imgs += view_segs
-			re_size = (256, 512)
-			view_imgs = [F.interpolate(img.unsqueeze(0), size=(256, 512), mode='bilinear', align_corners=True)[0] for img in view_imgs]
-			n_rows = 4
-		elif self.args.re_ref:   
-			view_imgs.append(self.normalize(re_ref_img[0]))
-			re_size = re_size
-			view_imgs = [F.interpolate(img.unsqueeze(0), size=re_size, mode='bilinear', align_corners=True)[0] for img in view_imgs]
-			n_rows = 4+2
-
-		else:
-			re_size = re_size
-			view_imgs = [F.interpolate(img.unsqueeze(0), size=re_size, mode='bilinear', align_corners=True)[0] for img in view_imgs]
-			n_rows = 4+1
+		re_size = re_size
+		view_imgs = [F.interpolate(img.unsqueeze(0), size=re_size, mode='bilinear', align_corners=True)[0] for img in view_imgs]
+		n_rows = 4+1
 
 		if flow is not None:
-			# print(flow.size())
-			flow_f = flow_to_image(flow[0,0].cpu().unsqueeze(0).permute(0,2,3,1).contiguous().numpy())
-			flow_f = F.interpolate(torch.tensor(flow_f).permute(0,3,1,2), size=re_size, mode='bilinear', align_corners=True)[0]
-			flow_b = flow_to_image(flow[0,1].cpu().unsqueeze(0).permute(0,2,3,1).contiguous().numpy())
-			flow_b = F.interpolate(torch.tensor(flow_b).permute(0,3,1,2), size=re_size, mode='bilinear', align_corners=True)[0]
-			view_imgs += [flow_f, self.base_flow_map, flow_b]
+			flow_f = self.flow_to_image(flow[0,0].cpu()).unsqueeze(0)
+			flow_f = F.interpolate(flow_f, size=re_size, mode='bilinear', align_corners=True)[0]
+			flow_b = self.flow_to_image(flow[0,1].cpu()).unsqueeze(0)
+			flow_b = F.interpolate(flow_b, size=re_size, mode='bilinear', align_corners=True)[0]
+			view_imgs += [flow_f,  flow_b, self.base_flow_map]
 
 		write_in_img = make_grid(view_imgs, nrow=n_rows)
-		# else:
-		#     view_segs.insert(3, torch.zeros_like(view_segs[-1]))
 
-		#     view_pred_rgbs = []
-		#     view_pred_segs = []
-		#     for i in range(self.args.extra_length):
-		#         pred_rgb = self.normalize(img[i][0].cpu())
-		#         pred_seg = vis_seg_mask(seg[i].cpu(), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
-		#         view_pred_rgbs.append(pred_rgb)
-		#         view_pred_segs.append(pred_seg)
-		#     write_in_img = make_grid(view_rgbs + view_segs + view_pred_rgbs + view_pred_segs, nrow=4)
+		return write_in_img
 
+	def prepare_image_sets(self, data, coarse_imgs, refined_imgs, segs, high_res_imgs=None, re_ref_imgs=None):
+		nrows = self.args.vid_length+2
+		if self.args.dataset != 'vimeo':
+			re_size = (128, 256)
+		else:
+			re_size = (256, 448)
+		view_gt_rgbs = []
+		
+		for i in range(nrows):
+			view_gt_rgbs.append(self.normalize(data['frame{:d}'.format(i+1)][0]))
+
+		black_img = torch.zeros_like(view_gt_rgbs[0])
+
+		# coarse
+		coarse_rgbs = [black_img]*2 + [ self.normalize(coarse_imgs[i][0]) for i in range(nrows-2)]
+		refine_rgbs = [black_img]*2 + [ self.normalize(refined_imgs[i][0]) for i in range(nrows-2)]
+		view_imgs = view_gt_rgbs + refine_rgbs + coarse_rgbs
+		if self.args.re_ref:
+			re_ref_imgs = [black_img]*2 + [ self.normalize(re_ref_imgs[i][0]) for i in range(nrows-2)]
+			view_imgs = view_gt_rgbs + re_ref_imgs + refine_rgbs + coarse_rgbs
+
+		if self.args.mode=='xs2xs':
+			view_gt_segs = [vis_seg_mask(data['seg'+str(i+1)][0].unsqueeze(0), 20).squeeze(0) for i in range(nrows)]
+			pred_segs = [black_img]*2 + [ vis_seg_mask(segs[i][0].unsqueeze(0), 20).squeeze(0) for i in range(nrows-2)]
+			view_segs = view_gt_segs + pred_segs
+			view_imgs = view_segs + view_imgs
+
+		write_in_img = make_grid(view_imgs, nrow=nrows)
 		
 		return write_in_img
+
+	def get_loss_record_dict(self,prefix=''):
+		D = {'{}_data_cnt'.format(prefix):0,
+			'{}_all_loss_record'.format(prefix):0}
+		if self.args.syn_type == 'extra':
+			for i in range(self.args.num_pred_step*self.args.num_pred_once):
+				d = {
+				'{}_frame_{}_coarse_l1_loss_record'.format(prefix, i+1):0,
+				'{}_frame_{}_coarse_ssim_loss_record'.format(prefix, i+1):0,
+				'{}_frame_{}_coarse_gdl_loss_record'.format(prefix, i+1):0,
+				'{}_frame_{}_coarse_vgg_loss_record'.format(prefix, i+1):0,
+				'{}_frame_{}_coarse_ce_loss_record'.format(prefix, i+1):0,
+				'{}_frame_{}_coarse_all_loss_record'.format(prefix, i+1):0
+				}
+				D.update(d)
+				if self.args.inpaint:
+					d = {
+					'{}_frame_{}_inpaint_l1_loss_record'.format(prefix, i+1):0,
+					'{}_frame_{}_inpaint_gdl_loss_record'.format(prefix, i+1):0,
+					'{}_frame_{}_inpaint_mask_loss_record'.format(prefix, i+1):0,
+					'{}_frame_{}_inpaint_all_loss_record'.format(prefix, i+1):0
+					}
+					D.update(d)
+		else:
+			d = {
+				'{}_coarse_l1_loss_record'.format(prefix):0,
+				'{}_coarse_ssim_loss_record'.format(prefix):0,
+				'{}_coarse_gdl_loss_record'.format(prefix):0,
+				'{}_coarse_vgg_loss_record'.format(prefix):0,
+				'{}_coarse_ce_loss_record'.format(prefix):0,
+				'{}_coarse_all_loss_record'.format(prefix):0
+				}
+			D.update(d)
+		return D
+
+	def update_loss_record_dict(self, record_dict, loss_dict, batch_size):
+		record_dict['step_data_cnt']+=batch_size
+		if self.args.syn_type == 'extra':
+			for i in range(self.args.num_pred_step):
+				for j in range(self.args.num_pred_once):
+					frame_ind = 1+i*self.args.num_pred_once + j
+					for loss_name in ['l1', 'gdl', 'ssim', 'vgg', 'ce']:
+						record_dict['step_frame_{}_coarse_{}_loss_record'.format(frame_ind, loss_name)] += \
+										batch_size*loss_dict['step_{}_frame_{}_{}_loss'.format(i, j, loss_name)].item()
+						record_dict['step_frame_{}_coarse_all_loss_record'.format(frame_ind)] += \
+										batch_size*loss_dict['step_{}_frame_{}_{}_loss'.format(i, j, loss_name)].item()
+					if self.args.inpaint:
+						frame_ind = 1+i*self.args.num_pred_once + j
+						for loss_name in ['l1', 'gdl', 'mask']:
+							record_dict['step_frame_{}_inpaint_{}_loss_record'.format(frame_ind, loss_name)] += \
+											batch_size*loss_dict['step_{}_frame_{}_inpaint_{}_loss'.format(i, j, loss_name)].item()
+							record_dict['step_frame_{}_inpaint_all_loss_record'.format(frame_ind)] += \
+											batch_size*loss_dict['step_{}_frame_{}_inpaint_{}_loss'.format(i, j, loss_name)].item()
+
+		else:
+			for loss_name in ['l1', 'gdl', 'ssim', 'vgg', 'ce']:
+				record_dict['step_coarse_{}_loss_record'.format(loss_name)] += \
+											batch_size*loss_dict['step_{}_frame_{}_{}_loss'.format(i, j, loss_name)].item()
+				record_dict['step_coarse_all_loss_record'.format(frame_ind)] += \
+										batch_size*loss_dict['step_{}_frame_{}_{}_loss'.format(i, j, loss_name)].item()
+		record_dict['step_all_loss_record']+=batch_size*loss_dict['loss_all'].item()
+		return record_dict
+
+
 
 	def train(self):
 		self.args.logger.info('Training started')
@@ -283,134 +402,84 @@ class Refiner:
 		load_time = 0
 		comp_time = 0
 
-		coarse_l1_loss_record = 0
-		coarse_ssim_loss_record = 0
-		coarse_vgg_loss_record = 0
-		coarse_loss_all_record = 0
-		coarse_ce_loss_record = 0
+		step_loss_record_dict = self.get_loss_record_dict('step')
+		epoch_loss_record_dict = self.get_loss_record_dict('epoch')
 
-		refine_l1_loss_record = 0
-		refine_vgg_loss_record = 0
-		refine_gdl_loss_record = 0
-		refine_loss_all_record = 0
-
-		refine_h_l1_loss_record = 0
-		refine_h_vgg_loss_record = 0
-		refine_h_gdl_loss_record = 0
-		refine_h_loss_all_record = 0
-
-		if self.args.high_res:
-			refine_high_res_l1_loss_record = 0
-			refine_high_res_vgg_loss_record = 0 # dont use vgg since network is too big
-			refine_high_res_gdl_loss_record = 0
-			refine_high_res_loss_all_record = 0
-			loss_all_all_record = 0
-
-		if self.args.re_ref:
-			refine_re_ref_l1_loss_record = 0
-			refine_re_ref_vgg_loss_record = 0 # dont use vgg since network is too big
-			refine_re_ref_gdl_loss_record = 0
-			refine_re_ref_loss_all_record = 0
-			loss_all_all_record = 0
-
-		loss_all_record = 0
-
-		data_all_count = 0
-
-		epoch_coarse_l1_loss_record = 0
-		epoch_coarse_ssim_loss_record = 0
-		epoch_coarse_vgg_loss_record = 0
-		epoch_coarse_loss_all_record = 0
-		epoch_coarse_ce_loss_record = 0
-
-		epoch_refine_l1_loss_record = 0
-		epoch_refine_vgg_loss_record = 0
-		epoch_refine_gdl_loss_record = 0
-		epoch_refine_loss_all_record = 0
-
-		epoch_refine_h_l1_loss_record = 0
-		epoch_refine_h_vgg_loss_record = 0
-		epoch_refine_h_gdl_loss_record = 0
-		epoch_refine_h_vgg_loss_record = 0
-		epoch_refine_h_loss_all_record = 0
-
-		if self.args.high_res:
-			epoch_refine_high_res_l1_loss_record = 0
-			epoch_refine_high_res_vgg_loss_record = 0
-			epoch_refine_high_res_gdl_loss_record = 0
-			epoch_refine_high_res_loss_all_record = 0
-			epoch_loss_all_all_record = 0
-
-		if self.args.re_ref:
-			epoch_refine_re_ref_l1_loss_record = 0
-			epoch_refine_re_ref_vgg_loss_record = 0
-			epoch_refine_re_ref_gdl_loss_record = 0
-			epoch_refine_re_ref_loss_all_record = 0
-			epoch_loss_all_all_record = 0
-
-		epoch_loss_all_record = 0
-		
-
-		epoch_data_all_count = 0
-		# print("length", len(self.train_loader))
 		for step, data in enumerate(self.train_loader):
 			self.step = step
 			load_time += time() - end
 			end = time()
 			# for tensorboard
 			self.global_step += 1
-			# forward pass
-			# if not self.args.high_res:
-			#   x, fg_mask, gt = self.get_input(data)
-			#   x = x.cuda(self.args.rank, non_blocking=True)
-			#   fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True)
-			#   gt = gt.cuda(self.args.rank, non_blocking=True)
-			# else:
-			x, seg, fg_mask, gt_x, gt_seg = self.get_input(data)
-			x = x.cuda(self.args.rank, non_blocking=True)
-			seg = seg.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
-			fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True) if self.args.mode == 'xs2xs' else None
-			gt_seg = gt_seg.cuda(self.args.rank, non_blocking=True) if self.args.mode == 'xs2xs' else None
-			gt_x = gt_x.cuda(self.args.rank, non_blocking=True)
-			
 
-			batch_size_p = x.size(0)
-			data_all_count += batch_size_p
-			epoch_data_all_count += batch_size_p
+			batch_size_p = data['frame1'].size(0)
+			if self.args.syn_type == 'inter':
+				x, seg, fg_mask, gt_x, gt_seg = self.get_input(data)
+				x = x.cuda(self.args.rank, non_blocking=True)
+				seg = seg.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
+				fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True) if self.args.mode == 'xs2xs' else None
+				gt_seg = gt_seg.cuda(self.args.rank, non_blocking=True) if self.args.mode == 'xs2xs' else None
+				gt_x = gt_x.cuda(self.args.rank, non_blocking=True)
+				
 
-			# if not self.args.high_res:
-			#   coarse_img, refined_imgs, _, seg = self.model(x, fg_mask, gt=gt)
-			#   if not self.args.lock_coarse and not self.args.lock_retrain:
-			#       loss_dict = self.coarse_RGBLoss(coarse_img, gt[:, :3], False)
-			#       if self.args.mode == 'xs2xs':
-			#          loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(seg, torch.argmax(gt[:,3:], dim=1))   
-			#   else:
-			#       loss_dict = OrderedDict()
-			
-			#   for i in range(self.args.n_scales):
-			#       # print(i, refined_imgs[-i].size())
-			#       loss_dict.update(self.refine_RGBLoss(refined_imgs[-i-1], F.interpolate(gt[:,:3], scale_factor=(1/2)**i, mode='bilinear', align_corners=True),\
-			#                                                            refine_scale=1/(2**i), step=self.global_step, normed=False))               
-			# else:x
-			coarse_img, refined_imgs, refined_h_img, re_refd_img, seg, attn_flow = self.model(x, fg_mask, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
-			scaled_gt_x = F.interpolate(gt_x, scale_factor=0.5, mode='bilinear', align_corners=True) if self.args.high_res else gt_x
-			if not self.args.lock_coarse and not self.args.lock_retrain:
-				loss_dict = self.coarse_RGBLoss(coarse_img, scaled_gt_x, False)
-				if self.args.mode == 'xs2xs':
-				   loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(seg, torch.argmax(gt_seg, dim=1))   
+				coarse_img, refined_imgs, seg, attn_flow = self.model(x, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
+				scaled_gt_x = gt_x
+				if not self.args.lock_coarse and not self.args.lock_retrain:
+					loss_dict = self.coarse_RGBLoss(coarse_img, scaled_gt_x, False)
+					if self.args.mode == 'xs2xs':
+					   loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(seg, torch.argmax(gt_seg, dim=1))   
+				else:
+					loss_dict = OrderedDict()
+
 			else:
 				loss_dict = OrderedDict()
+				output_imgs = []
+				output_inpaints = []
+				output_masks = []
+				output_segs = []
+				last_rgb_output = torch.cat([data['frame1'], data['frame2']], dim=1).cuda(self.args.rank, non_blocking=True)
+				last_seg_output = torch.cat([data['seg1'], data['seg2']], dim=1).cuda(self.args.rank, non_blocking=True)
+				if self.args.num_pred_step > 1:
+					assert self.args.num_pred_once == 1
+				for i in range(self.args.num_pred_step):
+					gt_start_frame_ind = 3+i*self.args.num_pred_once
+					gt_x = torch.cat([data['frame'+str(i)] 
+										 for i in range(gt_start_frame_ind, gt_start_frame_ind+self.args.num_pred_once)], dim=1)\
+												.cuda(self.args.rank, non_blocking=True)
+					gt_seg = gt_rgb = torch.cat([data['seg'+str(i)] 
+										 for i in range(gt_start_frame_ind, gt_start_frame_ind+self.args.num_pred_once)], dim=1)\
+												.cuda(self.args.rank, non_blocking=True)
 
-			for i in range(self.args.n_scales):
-				# print(i, refined_imgs[-i].size())
-				loss_dict.update(self.refine_RGBLoss(refined_imgs[-i-1], F.interpolate(scaled_gt_x, scale_factor=(1/2)**i, mode='bilinear', align_corners=True),\
-																	 refine_scale=1/(2**i), step=self.global_step, normed=False))   
-			if self.args.high_res:
-				loss_dict.update(self.refine_RGBLoss(refined_h_img, gt_x, refine_scale=1, step=self.global_step, normed=False, res=2))
+					x = last_rgb_output
+					seg = last_seg_output
+					if self.args.fix_init_frames:
+						x = torch.cat([data['frame2'].detach().cuda(self.args.rank, non_blocking=True), x], dim=1)
+						seg = torch.cat([data['seg2'].detach().cuda(self.args.rank, non_blocking=True), seg], dim=1)
 
-			if self.args.re_ref:
-				loss_dict.update(self.refine_RGBLoss(re_refd_img, gt_x, refine_scale=1, step=self.global_step, normed=False, res=3))
+					coarse_img, refined_imgs, out_seg, attn_flow, mask, inpainted_img = self.model(x, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
+					for j in range(self.args.num_pred_once):
+						prefix='step_{}_frame_{}'.format(i,j)
+						loss_dict.update(self.coarse_RGBLoss(coarse_img[:,j*3:j*3+3], gt_x[:,j*3:j*3+3], False, prefix=prefix))
+						loss_dict[prefix+'_ce_loss'] = self.args.ce_weight*self.SegLoss(out_seg[:,j*20:j*20+20], torch.argmax(gt_seg[:,j*20:j*20+20], dim=1))   
+						output_imgs.append(coarse_img[:,j*3:j*3+3])
+						output_segs.append(out_seg[:,j*20:j*20+20])
 
+						if self.args.inpaint:
+							prefix='step_{}_frame_{}_inpaint'.format(i,j)
+							loss_dict.update(self.coarse_RGBLoss(inpainted_img[:,j*3:j*3+3]*(1-mask[:,j:j+1]), gt_x[:,j*3:j*3+3]*(1-mask[:,j:j+1]), False, prefix=prefix))
+							loss_dict[prefix+'_mask_loss'] = 80*mask[:,j:j+1].mean()
+							output_masks.append(mask[:,j:j+1])
+							output_inpaints.append(inpainted_img[:,j*3:j*3+3])
+
+
+					# following will only matter when num_pred_once == 1
+					if self.args.num_pred_step == 1:
+						break
+					back_img = inpainted_img if self.args.inpaint else coarse_img
+					last_rgb_output = torch.cat( [ x[:,-3:], back_img ], dim=1) 
+					last_seg_output = torch.cat( [ seg[:,-20:], 
+													torch.eye(20)[out_seg.argmax(dim=1)].permute(0,3,1,2).contiguous().cuda(self.args.rank, non_blocking=True)], dim=1)
+			
 			# loss and accuracy
 			loss = 0
 			for i in loss_dict.values():
@@ -422,90 +491,18 @@ class Refiner:
 			# backward pass
 			self.coarse_optimizer.zero_grad()
 			self.refine_optimizer.zero_grad()
-			if self.args.high_res:
-				self.high_res_optimizer.zero_grad()
-			if self.args.re_ref:
-				self.re_ref_optimizer.zero_grad()
 
 			loss_dict['loss_all'].backward()
 			# init step in the first train steps
 			if not self.args.lock_coarse and not self.args.lock_low:
 				self.coarse_optimizer.step()
-			if not self.args.lock_low:
+			if not self.args.lock_low and not self.args.lock_refine:
 				self.refine_optimizer.step()
-			if self.args.high_res:
-				self.high_res_optimizer.step()
-			if self.args.re_ref:
-				self.re_ref_optimizer.step()
 			comp_time += time() - end
 			end = time()
 
-			# update coarse record 
-			if not self.args.lock_coarse:
-				coarse_l1_loss_record   += batch_size_p*loss_dict['l1_loss'].item()
-				coarse_ssim_loss_record += batch_size_p*loss_dict['ssim_loss'].item()
-				coarse_vgg_loss_record  += batch_size_p*loss_dict['vgg_loss'].item()
-				coarse_loss_all_record  = (coarse_l1_loss_record + coarse_ssim_loss_record + coarse_vgg_loss_record)
-				coarse_ce_loss_record   += batch_size_p*loss_dict['ce_loss'].item() if self.args.mode=='xs2xs' else 0
+			step_loss_record_dict = self.update_loss_record_dict(step_loss_record_dict, loss_dict, batch_size_p)
 
-			# if not self.args.lock_low:
-			# update refine 1.0 record 
-			refine_l1_loss_record   += batch_size_p*loss_dict['refine_1.00_l1_loss'].item()
-			refine_vgg_loss_record  += batch_size_p*loss_dict['refine_1.00_vgg_loss'].item()
-			refine_gdl_loss_record  += batch_size_p*loss_dict['refine_1.00_gdl_loss'].item()
-			refine_loss_all_record  = (refine_l1_loss_record + refine_vgg_loss_record + refine_gdl_loss_record)
-
-
-			if self.args.n_scales == 2:
-				# update refine 0.5 record 
-				refine_h_l1_loss_record   += batch_size_p*loss_dict['refine_0.50_l1_loss'].item()
-				refine_h_vgg_loss_record  += batch_size_p*loss_dict['refine_0.50_vgg_loss'].item()
-				refine_h_gdl_loss_record  += batch_size_p*loss_dict['refine_0.50_gdl_loss'].item()
-				refine_h_loss_all_record  = (refine_h_l1_loss_record + refine_h_vgg_loss_record + refine_h_gdl_loss_record)
-
-			# update all loss record 
-			loss_all_record = coarse_loss_all_record + coarse_ce_loss_record + refine_loss_all_record + refine_h_loss_all_record
-
-			if self.args.high_res:
-				# update high res record
-				refine_high_res_l1_loss_record   += batch_size_p*loss_dict['refine_2_l1_loss'].item()
-				refine_high_res_vgg_loss_record  += batch_size_p*loss_dict['refine_2_vgg_loss'].item()
-				refine_high_res_gdl_loss_record  += batch_size_p*loss_dict['refine_2_gdl_loss'].item()
-				refine_high_res_loss_all_record  = (refine_high_res_l1_loss_record + refine_high_res_vgg_loss_record + refine_high_res_gdl_loss_record)
-
-				loss_all_all_record = loss_all_record + refine_high_res_loss_all_record
-
-			if self.args.re_ref:
-				# update high res record
-				refine_re_ref_l1_loss_record   += batch_size_p*loss_dict['refine_3_l1_loss'].item()
-				refine_re_ref_vgg_loss_record  += batch_size_p*loss_dict['refine_3_vgg_loss'].item()
-				refine_re_ref_gdl_loss_record  += batch_size_p*loss_dict['refine_3_gdl_loss'].item()
-				refine_re_ref_loss_all_record  = (refine_re_ref_l1_loss_record + refine_re_ref_vgg_loss_record + refine_re_ref_gdl_loss_record)
-
-				loss_all_all_record = loss_all_record + refine_re_ref_loss_all_record
-
-			# updata epoch record
-			if not self.args.lock_coarse:
-				epoch_coarse_l1_loss_record   += batch_size_p*loss_dict['l1_loss'].item()
-				epoch_coarse_ssim_loss_record += batch_size_p*loss_dict['ssim_loss'].item()
-				epoch_coarse_vgg_loss_record  += batch_size_p*loss_dict['vgg_loss'].item()
-				epoch_coarse_ce_loss_record   += batch_size_p*loss_dict['ce_loss'].item() if self.args.mode=='xs2xs' else 0
-			# if not self.args.lock_low:
-			epoch_refine_l1_loss_record   += batch_size_p*loss_dict['refine_1.00_l1_loss'].item()
-			epoch_refine_vgg_loss_record  += batch_size_p*loss_dict['refine_1.00_vgg_loss'].item()
-			epoch_refine_gdl_loss_record  += batch_size_p*loss_dict['refine_1.00_gdl_loss'].item()
-			if self.args.n_scales == 2:
-				epoch_refine_h_l1_loss_record   += batch_size_p*loss_dict['refine_0.50_l1_loss'].item()
-				epoch_refine_h_vgg_loss_record  += batch_size_p*loss_dict['refine_0.50_vgg_loss'].item()
-				epoch_refine_h_gdl_loss_record  += batch_size_p*loss_dict['refine_0.50_gdl_loss'].item()
-			if self.args.high_res:
-				epoch_refine_high_res_l1_loss_record   += batch_size_p*loss_dict['refine_2_l1_loss'].item()
-				epoch_refine_high_res_vgg_loss_record  += batch_size_p*loss_dict['refine_2_vgg_loss'].item()
-				epoch_refine_high_res_gdl_loss_record  += batch_size_p*loss_dict['refine_2_gdl_loss'].item()
-			if self.args.re_ref:
-				epoch_refine_re_ref_l1_loss_record   += batch_size_p*loss_dict['refine_3_l1_loss'].item()
-				epoch_refine_re_ref_vgg_loss_record  += batch_size_p*loss_dict['refine_3_vgg_loss'].item()
-				epoch_refine_re_ref_gdl_loss_record  += batch_size_p*loss_dict['refine_3_gdl_loss'].item()
 
 			if self.args.rank == 0:
 				# add info to tensorboard
@@ -513,248 +510,120 @@ class Refiner:
 				self.writer.add_scalars("losses", info, self.global_step)
 				# print
 				if self.step % self.args.disp_interval == 0:
-					if data_all_count != 0:
-						coarse_l1_loss_record   /= data_all_count
-						coarse_ssim_loss_record /= data_all_count
-						coarse_vgg_loss_record  /= data_all_count
-						coarse_loss_all_record  /= data_all_count
-						coarse_ce_loss_record   /= data_all_count
+					for key, value in step_loss_record_dict.items():
+						epoch_key = key.replace('step', 'epoch')
+						epoch_loss_record_dict[epoch_key]+=value
 
-						refine_l1_loss_record   /= data_all_count
-						refine_vgg_loss_record  /= data_all_count
-						refine_gdl_loss_record  /= data_all_count
-						refine_loss_all_record  /= data_all_count
+					if step_loss_record_dict['step_data_cnt'] != 0:
+						for key, value in step_loss_record_dict.items():
+							if key!='step_data_cnt':
+								step_loss_record_dict[key] /= step_loss_record_dict['step_data_cnt']
 
-						refine_h_l1_loss_record   /= data_all_count
-						refine_h_vgg_loss_record  /= data_all_count
-						refine_h_gdl_loss_record  /= data_all_count
-						refine_h_loss_all_record  /= data_all_count
-
-						loss_all_record /= data_all_count
-						if self.args.high_res:
-							refine_high_res_l1_loss_record   /= data_all_count
-							refine_high_res_vgg_loss_record  /= data_all_count
-							refine_high_res_gdl_loss_record  /= data_all_count
-							refine_high_res_loss_all_record  /= data_all_count
-							loss_all_all_record /= data_all_count
-						if self.args.re_ref:
-							refine_re_ref_l1_loss_record   /= data_all_count
-							refine_re_ref_vgg_loss_record  /= data_all_count
-							refine_re_ref_gdl_loss_record  /= data_all_count
-							refine_re_ref_loss_all_record  /= data_all_count
-							loss_all_all_record /= data_all_count
-
-					if self.args.high_res:
-						self.args.logger.info(
-							'Epoch [{epoch:d}/{tot_epoch:d}][{cur_batch:d}/{tot_batch:d}] '
-							'load [{load_time:.3f}s] comp [{comp_time:.3f}s] '
-							'\n\t\tcoarse l1 [{l1:.4f}] vgg [{vgg:.4f}] ssim [{ssim:.4f}] rgb_all [{rgb_all:.4f}] ce  [{ce:.4f}] '
-							'\n\t\tref0.5 l1 [{refine_h_l1:.4f}] vgg [{refine_h_vgg:.4f}] gdl  [{refine_h_gdl:.4f}] rgb_all [{refine_h_all:.4f}]'
-							'\n\t\trefine l1 [{refine_l1:.4f}] vgg [{refine_vgg:.4f}] gdl  [{refine_gdl:.4f}] rgb_all [{refine_all:.4f}] low all [{low_all:.4f}]'
-							'\n\t\thighre l1 [{high_res_l1:.4f}] gdl  [{high_res_gdl:.4f}] rgb_all [{high_res_all:.4f}] all [{all:.4f}]'.format(
-								epoch=self.epoch, tot_epoch=self.args.epochs,
-								cur_batch=self.step+1, tot_batch=len(self.train_loader),
-								load_time=load_time, comp_time=comp_time,
-								l1=coarse_l1_loss_record, vgg=coarse_vgg_loss_record, ssim=coarse_ssim_loss_record, rgb_all=coarse_loss_all_record, ce=coarse_ce_loss_record,
-								refine_h_l1=refine_h_l1_loss_record, refine_h_vgg=refine_h_vgg_loss_record, refine_h_gdl=refine_h_gdl_loss_record, refine_h_all=refine_h_loss_all_record,
-								refine_l1=refine_l1_loss_record, refine_vgg=refine_vgg_loss_record, refine_gdl=refine_gdl_loss_record, refine_all=refine_loss_all_record, low_all=loss_all_record,
-								high_res_l1=refine_high_res_l1_loss_record, high_res_gdl=refine_high_res_gdl_loss_record, high_res_all=refine_high_res_loss_all_record, all=loss_all_all_record
+					log_main = 'Epoch [{epoch:d}/{tot_epoch:d}][{cur_batch:d}/{tot_batch:d}] load [{load_time:.3f}s] comp [{comp_time:.3f}s] '.format(epoch=self.epoch, tot_epoch=self.args.epochs,
+							cur_batch=self.step+1, tot_batch=len(self.train_loader),
+							load_time=load_time, comp_time=comp_time)
+					for i in range(self.args.num_pred_once*self.args.num_pred_step):
+						log = '\n\tframe{ind:.0f} l1 [{l1:.3f}] vgg [{vgg:.3f}] ssim [{ssim:.3f}] gdl [{gdl:.3f}] rgb_all [{rgb_all:.3f}] ce [{ce:.3f}]'.format(
+								ind=i+1, 
+								l1=step_loss_record_dict['step_frame_{}_coarse_l1_loss_record'.format(i+1)],
+								vgg=step_loss_record_dict['step_frame_{}_coarse_vgg_loss_record'.format(i+1)],
+								ssim=step_loss_record_dict['step_frame_{}_coarse_ssim_loss_record'.format(i+1)],
+								gdl=step_loss_record_dict['step_frame_{}_coarse_gdl_loss_record'.format(i+1)],
+								ce=step_loss_record_dict['step_frame_{}_coarse_ce_loss_record'.format(i+1)],
+								rgb_all=step_loss_record_dict['step_frame_{}_coarse_all_loss_record'.format(i+1)]
 							)
-						)
-					elif self.args.re_ref:
-						self.args.logger.info(
-							'Epoch [{epoch:d}/{tot_epoch:d}][{cur_batch:d}/{tot_batch:d}] '
-							'load [{load_time:.3f}s] comp [{comp_time:.3f}s] '
-							'\n\t\tcoarse l1 [{l1:.4f}] vgg [{vgg:.4f}] ssim [{ssim:.4f}] rgb_all [{rgb_all:.4f}] ce  [{ce:.4f}] '
-							'\n\t\tref0.5 l1 [{refine_h_l1:.4f}] vgg [{refine_h_vgg:.4f}] gdl  [{refine_h_gdl:.4f}] rgb_all [{refine_h_all:.4f}]'
-							'\n\t\trefine l1 [{refine_l1:.4f}] vgg [{refine_vgg:.4f}] gdl  [{refine_gdl:.4f}] rgb_all [{refine_all:.4f}] low all [{low_all:.4f}]'
-							'\n\t\tre  re l1 [{re_ref_l1:.4f}] gdl  [{re_ref_gdl:.4f}] rgb_all [{re_ref_all:.4f}] all [{all:.4f}]'.format(
-								epoch=self.epoch, tot_epoch=self.args.epochs,
-								cur_batch=self.step+1, tot_batch=len(self.train_loader),
-								load_time=load_time, comp_time=comp_time,
-								l1=coarse_l1_loss_record, vgg=coarse_vgg_loss_record, ssim=coarse_ssim_loss_record, rgb_all=coarse_loss_all_record, ce=coarse_ce_loss_record,
-								refine_h_l1=refine_h_l1_loss_record, refine_h_vgg=refine_h_vgg_loss_record, refine_h_gdl=refine_h_gdl_loss_record, refine_h_all=refine_h_loss_all_record,
-								refine_l1=refine_l1_loss_record, refine_vgg=refine_vgg_loss_record, refine_gdl=refine_gdl_loss_record, refine_all=refine_loss_all_record, low_all=loss_all_record,
-								re_ref_l1=refine_re_ref_l1_loss_record, re_ref_gdl=refine_re_ref_gdl_loss_record, re_ref_all=refine_re_ref_loss_all_record, all=loss_all_all_record
-							)
-						)					
-					else:
-						self.args.logger.info(
-							'Epoch [{epoch:d}/{tot_epoch:d}][{cur_batch:d}/{tot_batch:d}] '
-							'load [{load_time:.3f}s] comp [{comp_time:.3f}s] '
-							'\n\t\tcoarse l1 [{l1:.4f}] vgg [{vgg:.4f}] ssim [{ssim:.4f}] rgb_all [{rgb_all:.4f}] ce  [{ce:.4f}] '
-							'\n\t\tref0.5 l1 [{refine_h_l1:.4f}] vgg [{refine_h_vgg:.4f}] gdl  [{refine_h_gdl:.4f}] rgb_all [{refine_h_all:.4f}]'
-							'\n\t\trefine l1 [{refine_l1:.4f}] vgg [{refine_vgg:.4f}] gdl  [{refine_gdl:.4f}] rgb_all [{refine_all:.4f}] all [{all:.4f}]'.format(
-								epoch=self.epoch, tot_epoch=self.args.epochs,
-								cur_batch=self.step+1, tot_batch=len(self.train_loader),
-								load_time=load_time, comp_time=comp_time,
-								l1=coarse_l1_loss_record, vgg=coarse_vgg_loss_record, ssim=coarse_ssim_loss_record, rgb_all=coarse_loss_all_record, ce=coarse_ce_loss_record,
-								refine_h_l1=refine_h_l1_loss_record, refine_h_vgg=refine_h_vgg_loss_record, refine_h_gdl=refine_h_gdl_loss_record, refine_h_all=refine_h_loss_all_record,
-								refine_l1=refine_l1_loss_record, refine_vgg=refine_vgg_loss_record, refine_gdl=refine_gdl_loss_record, refine_all=refine_loss_all_record, all=loss_all_record
-							)
-						)
+						log_main+=log
+						if self.args.inpaint:
+							log = ' inp l1 [{l1:.3f}] gdl [{gdl:.3f}] mask [{mask:.3f}] all [{inp_all:.3f}]'.format(
+									l1=step_loss_record_dict['step_frame_{}_inpaint_l1_loss_record'.format(i+1)],
+									gdl=step_loss_record_dict['step_frame_{}_inpaint_gdl_loss_record'.format(i+1)],
+									mask=step_loss_record_dict['step_frame_{}_inpaint_mask_loss_record'.format(i+1)],
+									inp_all=step_loss_record_dict['step_frame_{}_inpaint_all_loss_record'.format(i+1)]
+								)
+							log_main+=log
+					log_main += '\n\t\t\t\t\tloss total [{:.3f}]'.format(step_loss_record_dict['step_all_loss_record'])
+
+					self.args.logger.info(
+						log_main
+					)
 					comp_time = 0
 					load_time = 0
 
-					coarse_l1_loss_record = 0
-					coarse_ssim_loss_record = 0
-					coarse_vgg_loss_record = 0
-					coarse_loss_all_record = 0
-					coarse_ce_loss_record = 0
-
-					refine_l1_loss_record = 0
-					refine_vgg_loss_record = 0
-					refine_gdl_loss_record = 0
-					refine_loss_all_record = 0
-
-					refine_h_l1_loss_record = 0
-					refine_h_vgg_loss_record = 0
-					refine_h_gdl_loss_record = 0
-					refine_h_loss_all_record = 0
-
-					if self.args.high_res:
-						refine_high_res_l1_loss_record = 0
-						refine_high_res_vgg_loss_record = 0
-						refine_high_res_gdl_loss_record = 0
-						refine_high_res_loss_all_record = 0
-						loss_all_all_record = 0
-
-					if self.args.re_ref:
-						refine_re_ref_l1_loss_record = 0
-						refine_re_ref_vgg_loss_record = 0
-						refine_re_ref_gdl_loss_record = 0
-						refine_re_ref_loss_all_record = 0
-						loss_all_all_record = 0
-
-					loss_all_record = 0
-					
-					data_all_count = 0
+					for key,value in step_loss_record_dict.items():
+						step_loss_record_dict[key] = 0
 
 				if self.step % 30 == 0: 
-					if self.args.high_res:
-						image_set = self.prepare_image_set(data, coarse_img.cpu(), [ refined_img.cpu() for refined_img in refined_imgs], seg.cpu() if self.args.mode=='xs2xs' else None, high_res_img=refined_h_img.cpu(), flow=attn_flow)
-					elif self.args.re_ref:
-						image_set = self.prepare_image_set(data, coarse_img.cpu(), [ refined_img.cpu() for refined_img in refined_imgs], seg.cpu() if self.args.mode=='xs2xs' else None, re_ref_img=re_refd_img.cpu(), flow=attn_flow)
-					else:
-						image_set = self.prepare_image_set(data, coarse_img.cpu(), [ refined_img.cpu() for refined_img in refined_imgs], seg.cpu() if self.args.mode=='xs2xs' else None, flow=attn_flow)
+					# image_set = self.prepare_image_set(data, coarse_img.cpu(), [ refined_img.cpu() for refined_img in refined_imgs], seg.cpu() if self.args.mode=='xs2xs' else None, flow=attn_flow)
+					image_set = self.prepare_extra_image_set(data, [img.cpu() for img in output_imgs], [seg.cpu() for seg in output_segs], 
+															[m.cpu() for m in output_masks] if self.args.inpaint else None,
+															[m.cpu() for m in output_inpaints] if self.args.inpaint else None )
 					self.writer.add_image('image_{}'.format(self.global_step), image_set, self.global_step)
 		
+		for key, value in step_loss_record_dict.items():
+			epoch_key = key.replace('step', 'epoch')
+			epoch_loss_record_dict[epoch_key]+=value
 
-		# epoch summary
-		epoch_coarse_loss_all_record  = (epoch_coarse_l1_loss_record + epoch_coarse_ssim_loss_record + epoch_coarse_vgg_loss_record)
-		epoch_refine_loss_all_record  = (epoch_refine_l1_loss_record + epoch_refine_vgg_loss_record + epoch_refine_gdl_loss_record)
-		epoch_refine_h_loss_all_record  = (epoch_refine_h_l1_loss_record + epoch_refine_h_vgg_loss_record + epoch_refine_h_gdl_loss_record)
-		epoch_loss_all_record = epoch_coarse_loss_all_record + epoch_coarse_ce_loss_record + epoch_refine_loss_all_record + epoch_refine_h_loss_all_record
-
-		if self.args.high_res:
-			epoch_refine_high_res_loss_all_record  = (epoch_refine_high_res_l1_loss_record+ epoch_refine_high_res_vgg_loss_record + epoch_refine_high_res_gdl_loss_record)
-			epoch_loss_all_all_record = epoch_loss_all_record + epoch_refine_high_res_loss_all_record
-
-		if self.args.re_ref:
-			epoch_refine_re_ref_loss_all_record  = (epoch_refine_re_ref_l1_loss_record+ epoch_refine_re_ref_vgg_loss_record + epoch_refine_re_ref_gdl_loss_record)
-			epoch_loss_all_all_record = epoch_loss_all_record + epoch_refine_high_res_loss_all_record
-
-		epoch_coarse_l1_loss_record   /= epoch_data_all_count
-		epoch_coarse_ssim_loss_record /= epoch_data_all_count
-		epoch_coarse_vgg_loss_record  /= epoch_data_all_count
-		epoch_coarse_loss_all_record  /= epoch_data_all_count
-		epoch_coarse_ce_loss_record   /= epoch_data_all_count
-
-		epoch_refine_l1_loss_record   /= epoch_data_all_count
-		epoch_refine_vgg_loss_record  /= epoch_data_all_count
-		epoch_refine_gdl_loss_record  /= epoch_data_all_count
-		epoch_refine_loss_all_record  /= epoch_data_all_count
-
-		epoch_refine_h_l1_loss_record   /= epoch_data_all_count
-		epoch_refine_h_vgg_loss_record  /= epoch_data_all_count
-		epoch_refine_h_gdl_loss_record  /= epoch_data_all_count
-		epoch_refine_h_loss_all_record  /= epoch_data_all_count
-
-		if self.args.high_res:
-			epoch_refine_high_res_l1_loss_record   /= epoch_data_all_count
-			epoch_refine_high_res_vgg_loss_record  /= epoch_data_all_count
-			epoch_refine_high_res_gdl_loss_record  /= epoch_data_all_count
-			epoch_refine_high_res_loss_all_record  /= epoch_data_all_count
-			epoch_loss_all_all_record /= epoch_data_all_count
-
-		if self.args.re_ref:
-			epoch_refine_re_ref_l1_loss_record   /= epoch_data_all_count
-			epoch_refine_re_ref_vgg_loss_record  /= epoch_data_all_count
-			epoch_refine_re_ref_gdl_loss_record  /= epoch_data_all_count
-			epoch_refine_re_ref_loss_all_record  /= epoch_data_all_count
-			epoch_loss_all_all_record /= epoch_data_all_count
-
-		epoch_loss_all_record /= epoch_data_all_count
+		if epoch_loss_record_dict['epoch_data_cnt'] != 0:
+			for key, value in epoch_loss_record_dict.items():
+				if key!='epoch_data_cnt':
+					epoch_loss_record_dict[key] /= epoch_loss_record_dict['epoch_data_cnt']
 
 		if self.args.rank == 0:
-			if self.args.high_res:
-				self.args.logger.info(
-					'Epoch [{epoch:d}/{tot_epoch:d}] '
-					'\n\t\t\tcoarse l1 [{l1:.4f}] vgg [{vgg:.4f}] ssim [{ssim:.4f}] rgb_all [{rgb_all:.4f}] ce  [{ce:.4f}] '
-					'\n\t\t\tref0.5 l1 [{refine_h_l1:.4f}] vgg [{refine_h_vgg:.4f}] gdl  [{refine_h_gdl:.4f}] rgb_all [{refine_h_all:.4f}]'
-					'\n\t\t\trefine l1 [{refine_l1:.4f}] vgg [{refine_vgg:.4f}] gdl  [{refine_gdl:.4f}] rgb_all [{refine_all:.4f}] low all [{low_all:.4f}]'
-					'\n\t\t\thighre l1 [{high_res_l1:.4f}] vgg [{high_res_vgg:.4f}] gdl  [{high_res_gdl:.4f}] rgb_all [{high_res_all:.4f}] all [{all:.4f}]'.format(
-						epoch=self.epoch, tot_epoch=self.args.epochs,
-						l1=epoch_coarse_l1_loss_record, vgg=epoch_coarse_vgg_loss_record, ssim=epoch_coarse_ssim_loss_record, rgb_all=epoch_coarse_loss_all_record, ce=epoch_coarse_ce_loss_record,
-						refine_h_l1=epoch_refine_h_l1_loss_record, refine_h_vgg=epoch_refine_h_vgg_loss_record, refine_h_gdl=epoch_refine_h_gdl_loss_record, refine_h_all=epoch_refine_h_loss_all_record,
-						refine_l1=epoch_refine_l1_loss_record, refine_vgg=epoch_refine_vgg_loss_record, refine_gdl=epoch_refine_gdl_loss_record, refine_all=epoch_refine_loss_all_record, low_all=epoch_loss_all_record,
-						high_res_l1=epoch_refine_high_res_l1_loss_record, high_res_vgg=epoch_refine_high_res_vgg_loss_record, high_res_gdl=epoch_refine_high_res_gdl_loss_record, high_res_all=epoch_refine_high_res_loss_all_record, all=epoch_loss_all_all_record
+			log_main = 'Epoch [{epoch:d}/{tot_epoch:d}]'.format(epoch=self.epoch, tot_epoch=self.args.epochs)
+
+			for i in range(self.args.num_pred_once*self.args.num_pred_step):
+				log = '\n\tframe {ind:.0f} l1 [{l1:.3f}] vgg [{vgg:.3f}] ssim [{ssim:.3f}] gdl [{gdl:.3f}] rgb_all [{rgb_all:.3f}] ce [{ce:.3f}]'.format(
+						ind=1+i, 
+						l1=epoch_loss_record_dict['epoch_frame_{}_coarse_l1_loss_record'.format(i+1)],
+						vgg=epoch_loss_record_dict['epoch_frame_{}_coarse_vgg_loss_record'.format(i+1)],
+						ssim=epoch_loss_record_dict['epoch_frame_{}_coarse_ssim_loss_record'.format(i+1)],
+						gdl=epoch_loss_record_dict['epoch_frame_{}_coarse_gdl_loss_record'.format(i+1)],
+						ce=epoch_loss_record_dict['epoch_frame_{}_coarse_ce_loss_record'.format(i+1)],
+						rgb_all=epoch_loss_record_dict['epoch_frame_{}_coarse_all_loss_record'.format(i+1)]
 					)
-				)
-			elif self.args.re_ref:
-				self.args.logger.info(
-					'Epoch [{epoch:d}/{tot_epoch:d}] '
-					'\n\t\t\tcoarse l1 [{l1:.4f}] vgg [{vgg:.4f}] ssim [{ssim:.4f}] rgb_all [{rgb_all:.4f}] ce  [{ce:.4f}] '
-					'\n\t\t\tref0.5 l1 [{refine_h_l1:.4f}] vgg [{refine_h_vgg:.4f}] gdl  [{refine_h_gdl:.4f}] rgb_all [{refine_h_all:.4f}]'
-					'\n\t\t\trefine l1 [{refine_l1:.4f}] vgg [{refine_vgg:.4f}] gdl  [{refine_gdl:.4f}] rgb_all [{refine_all:.4f}] low all [{low_all:.4f}]'
-					'\n\t\t\tre  re l1 [{re_ref_l1:.4f}] vgg [{re_ref_vgg:.4f}] gdl  [{re_ref_gdl:.4f}] rgb_all [{re_ref_all:.4f}] all [{all:.4f}]'.format(
-						epoch=self.epoch, tot_epoch=self.args.epochs,
-						l1=epoch_coarse_l1_loss_record, vgg=epoch_coarse_vgg_loss_record, ssim=epoch_coarse_ssim_loss_record, rgb_all=epoch_coarse_loss_all_record, ce=epoch_coarse_ce_loss_record,
-						refine_h_l1=epoch_refine_h_l1_loss_record, refine_h_vgg=epoch_refine_h_vgg_loss_record, refine_h_gdl=epoch_refine_h_gdl_loss_record, refine_h_all=epoch_refine_h_loss_all_record,
-						refine_l1=epoch_refine_l1_loss_record, refine_vgg=epoch_refine_vgg_loss_record, refine_gdl=epoch_refine_gdl_loss_record, refine_all=epoch_refine_loss_all_record, low_all=epoch_loss_all_record,
-						re_ref_l1=epoch_refine_re_ref_l1_loss_record, re_ref_vgg=epoch_refine_re_ref_vgg_loss_record, re_ref_gdl=epoch_refine_re_ref_gdl_loss_record, re_ref_all=epoch_refine_re_ref_loss_all_record, all=epoch_loss_all_all_record
-					)
-				)
-			else:
-				self.args.logger.info(
-					'Epoch [{epoch:d}/{tot_epoch:d}] '
-					'\n\t\t\tcoarse l1 [{l1:.4f}] vgg [{vgg:.4f}] ssim [{ssim:.4f}] rgb_all [{rgb_all:.4f}] ce  [{ce:.4f}] '
-					'\n\t\t\tref0.5 l1 [{refine_h_l1:.4f}] vgg [{refine_h_vgg:.4f}] gdl  [{refine_h_gdl:.4f}] rgb_all [{refine_h_all:.4f}]'
-					'\n\t\t\trefine l1 [{refine_l1:.4f}] vgg [{refine_vgg:.4f}] gdl  [{refine_gdl:.4f}] rgb_all [{refine_all:.4f}] all [{all:.4f}]'.format(
-						epoch=self.epoch,tot_epoch=self.args.epochs,
-						l1=epoch_coarse_l1_loss_record, vgg=epoch_coarse_vgg_loss_record, ssim=epoch_coarse_ssim_loss_record, rgb_all=epoch_coarse_loss_all_record, ce=epoch_coarse_ce_loss_record,
-						refine_h_l1=epoch_refine_h_l1_loss_record, refine_h_vgg=epoch_refine_h_vgg_loss_record, refine_h_gdl=epoch_refine_h_gdl_loss_record, refine_h_all=epoch_refine_h_loss_all_record,
-						refine_l1=epoch_refine_l1_loss_record, refine_vgg=epoch_refine_vgg_loss_record, refine_gdl=epoch_refine_gdl_loss_record, refine_all=epoch_refine_loss_all_record, all=epoch_loss_all_record
-					)
-				)
+				log_main+=log
+				if self.args.inpaint:
+					log = ' inp l1 [{l1:.3f}] gdl [{gdl:.3f}] mask [{mask:.3f}] all [{inp_all:.3f}]'.format(
+							l1=epoch_loss_record_dict['epoch_frame_{}_inpaint_l1_loss_record'.format(i+1)],
+							gdl=epoch_loss_record_dict['epoch_frame_{}_inpaint_gdl_loss_record'.format(i+1)],
+							mask=epoch_loss_record_dict['epoch_frame_{}_inpaint_mask_loss_record'.format(i+1)],
+							inp_all=epoch_loss_record_dict['epoch_frame_{}_inpaint_all_loss_record'.format(i+1)]
+						)
+					log_main+=log
+			log_main += '\n\t\t\t\t\t\t\tloss total [{:.3f}]'.format(epoch_loss_record_dict['epoch_all_loss_record'])
+
+			self.args.logger.info(
+				log_main
+			)
 
 	def validate(self, val_coarse=True):
 		self.args.logger.info('Validation epoch {} started'.format(self.epoch))
 		self.model.eval()
 
-		val_criteria = {
-			# 'l1': AverageMeter(),
-			# 'psnr':AverageMeter(),
-			# 'ssim':AverageMeter(),
-			# 'iou':AverageMeter(),
-			# 'vgg':AverageMeter()
-			'refine_l1': AverageMeter(),
-			'refine_psnr':AverageMeter(),
-			'refine_ssim':AverageMeter(),
-			'refine_vgg':AverageMeter()
-		}
-		if val_coarse:
-			val_criteria['l1'] = AverageMeter()
-			val_criteria['psnr'] = AverageMeter()
-			val_criteria['ssim'] = AverageMeter()
-			if self.args.mode == 'xs2xs':
-				val_criteria['iou'] = AverageMeter()
-			val_criteria['vgg'] = AverageMeter()
-		if self.args.high_res:
-			val_criteria['h_l1']  = AverageMeter()
-			val_criteria['h_psnr'] = AverageMeter()
-			val_criteria['h_ssim'] = AverageMeter()
-			val_criteria['h_vgg']  = AverageMeter()
+		val_criteria = {}
+
+		for i in range(self.args.vid_length):
+			val_criteria['{:d}_refine_l1'.format(i)]    = AverageMeter()
+			val_criteria['{:d}_refine_psnr'.format(i)]  = AverageMeter()
+			val_criteria['{:d}_refine_ssim'.format(i)]  = AverageMeter()
+			val_criteria['{:d}_refine_vgg'.format(i)]   = AverageMeter()
+			if val_coarse:
+				val_criteria['{:d}_l1'.format(i)] = AverageMeter()
+				val_criteria['{:d}_psnr'.format(i)] = AverageMeter()
+				val_criteria['{:d}_ssim'.format(i)] = AverageMeter()
+				if self.args.mode == 'xs2xs':
+					val_criteria['{:d}_iou'.format(i)] = AverageMeter()
+				val_criteria['{:d}_vgg'.format(i)] = AverageMeter()
+			if self.args.high_res:
+				val_criteria['{:d}_h_l1'.format(i)]  = AverageMeter()
+				val_criteria['{:d}_h_psnr'.format(i)] = AverageMeter()
+				val_criteria['{:d}_h_ssim'.format(i)] = AverageMeter()
+				val_criteria['{:d}_h_vgg'.format(i)]  = AverageMeter()
+			if self.args.re_ref:
+				val_criteria['{:d}_re_ref_l1'.format(i)]  = AverageMeter()
+				val_criteria['{:d}_re_ref_psnr'.format(i)] = AverageMeter()
+				val_criteria['{:d}_re_ref_ssim'.format(i)] = AverageMeter()
+				val_criteria['{:d}_re_ref_vgg'.format(i)]  = AverageMeter()
 		step_losses = OrderedDict()
 
 		with torch.no_grad():
@@ -766,68 +635,82 @@ class Refiner:
 				end = time()
 				self.step=i
 
-				# forward pass
-				# if not self.args.high_res:
-				#   x, fg_mask, gt = self.get_input(data)
-				#   size = x.size(0)
-				#   x = x.cuda(self.args.rank, non_blocking=True)
-				#   fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True)
-				#   gt = gt.cuda(self.args.rank, non_blocking=True)
-					
-				#   coarse_img, refine_imgs, seg = self.model(x, fg_mask)
-				#   coarse_gt = gt[:,:3]
-				#   gt_seg = gt[:, 3:]
-				# else:
-				x, seg, fg_mask, gt_x, gt_seg = self.get_input(data)
-				size = x.size(0)
-				x = x.cuda(self.args.rank, non_blocking=True)
-				seg = seg.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
-				fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
-				gt_x = gt_x.cuda(self.args.rank, non_blocking=True)
-				gt_seg = gt_seg.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
+				start_x, seg, fg_mask, gt_xs, gt_segs = self.get_inputs(data)
+				show_high_res_imgs=None
+				show_re_ref_imgs=None
+				show_segs = None
 
-				coarse_img, refine_imgs, refined_h_img, seg, attn_flow = self.model(x, fg_mask, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
-				coarse_gt = F.interpolate(gt_x, scale_factor=0.5, mode='bilinear', align_corners=True) if self.args.high_res else gt_x
-
+				show_coarse_imgs = []
+				show_refine_imgs = []
+				if self.args.mode == 'xs2xs':
+					show_segs = []
 				if self.args.high_res:
-					step_losses['h_l1'] =   self.L1Loss(refined_h_img, gt_x)
-					step_losses['h_psnr'] = self.PSNRLoss((refined_h_img+1)/2, (gt_x+1)/2)
-					step_losses['h_ssim'] = 1-self.SSIMLoss(refined_h_img, gt_x)
-					step_losses['h_vgg'] =  self.VGGCosLoss(refined_h_img, gt_x, False)
+					show_high_res_imgs = []
+				if self.args.re_ref:
+					show_re_ref_imgs = []
+				x=start_x
+				for pred_step in range(self.args.vid_length):
+					gt_x = gt_xs[pred_step]
+					gt_seg = gt_segs[pred_step]
 
-				# rgb criteria
-				if val_coarse:
-					step_losses['l1'] =   self.L1Loss(coarse_img, coarse_gt)
-					step_losses['psnr'] = self.PSNRLoss((coarse_img+1)/2, (coarse_gt+1)/2)
-					step_losses['ssim'] = 1-self.SSIMLoss(coarse_img, coarse_gt)
+					size = x.size(0)
+					x = x.cuda(self.args.rank, non_blocking=True)
+					seg = seg.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
+					fg_mask = None#fg_mask.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
+					gt_x = gt_x.cuda(self.args.rank, non_blocking=True)
+					gt_seg = gt_seg.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
+
+					coarse_img, refine_imgs, refined_h_img, re_ref_img, out_seg, attn_flow = self.model(x, fg_mask, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
+					coarse_gt = F.interpolate(gt_x, scale_factor=0.5, mode='bilinear', align_corners=True) if self.args.high_res else gt_x
+					refine_imgs = [refine_imgs[i].clamp_(-1, 1) for i in range(len(refine_imgs))]
+					show_coarse_imgs.append(coarse_img.cpu())
+					show_refine_imgs.append(refine_imgs[-1].cpu())
+					show_segs.append(out_seg.cpu())
+
+					
+					# rgb criteria
+					if val_coarse:
+						step_losses['{:d}_l1'.format(pred_step)] =   self.L1Loss(coarse_img, coarse_gt)
+						step_losses['{:d}_psnr'.format(pred_step)] = self.PSNRLoss((coarse_img+1)/2, (coarse_gt+1)/2)
+						step_losses['{:d}_ssim'.format(pred_step)] = 1-self.SSIMLoss(coarse_img, coarse_gt)
+						if self.args.mode == 'xs2xs':
+							step_losses['{:d}_iou'.format(pred_step)] =  self.IoULoss(torch.argmax(out_seg, dim=1), torch.argmax(gt_seg, dim=1))
+						step_losses['{:d}_vgg'.format(pred_step)] =  self.VGGCosLoss(coarse_img, coarse_gt, False)
+
 					if self.args.mode == 'xs2xs':
-						step_losses['iou'] =  self.IoULoss(torch.argmax(seg, dim=1), torch.argmax(gt_seg, dim=1))
-					step_losses['vgg'] =  self.VGGCosLoss(coarse_img, coarse_gt, False)
+						out_seg = torch.eye(20)[out_seg.argmax(dim=1)].permute(0,3,1,2).contiguous().cuda(self.args.rank, non_blocking=True)
+						seg = torch.cat([seg[:,20:], out_seg], dim=1)
 
-				step_losses['refine_l1'] =   self.L1Loss(refine_imgs[-1], coarse_gt)
-				step_losses['refine_psnr'] = self.PSNRLoss((refine_imgs[-1]+1)/2, (coarse_gt+1)/2)
-				step_losses['refine_ssim'] = 1-self.SSIMLoss(refine_imgs[-1], coarse_gt)
-				step_losses['refine_vgg'] =  self.VGGCosLoss(refine_imgs[-1], coarse_gt, False)
+					step_losses['{:d}_refine_l1'.format(pred_step)] =   self.L1Loss(refine_imgs[-1], coarse_gt)
+					step_losses['{:d}_refine_psnr'.format(pred_step)] = self.PSNRLoss((refine_imgs[-1]+1)/2, (coarse_gt+1)/2)
+					step_losses['{:d}_refine_ssim'.format(pred_step)] = 1-self.SSIMLoss(refine_imgs[-1], coarse_gt)
+					step_losses['{:d}_refine_vgg'.format(pred_step)] =  self.VGGCosLoss(refine_imgs[-1], coarse_gt, False)
+
+					if self.args.high_res:
+						refined_h_img = refined_h_img.clamp_(-1, 1)
+						show_high_res_imgs.append(refined_h_img)
+						step_losses['{:d}_h_l1'.format(pred_step)] =   self.L1Loss(refined_h_img, gt_x)
+						step_losses['{:d}_h_psnr'.format(pred_step)] = self.PSNRLoss((refined_h_img+1)/2, (gt_x+1)/2)
+						step_losses['{:d}_h_ssim'.format(pred_step)] = 1-self.SSIMLoss(refined_h_img, gt_x)
+						step_losses['{:d}_h_vgg'.format(pred_step)] =  self.VGGCosLoss(refined_h_img, gt_x, False)
+
+					if self.args.re_ref:
+						re_ref_img = re_ref_img.clamp_(-1, 1)
+						show_re_ref_imgs.append(re_ref_img.cpu())
+						step_losses['{:d}_re_ref_l1'.format(pred_step)] =   self.L1Loss(re_ref_img, gt_x)
+						step_losses['{:d}_re_ref_psnr'.format(pred_step)] = self.PSNRLoss((re_ref_img+1)/2, (gt_x+1)/2)
+						step_losses['{:d}_re_ref_ssim'.format(pred_step)] = 1-self.SSIMLoss(re_ref_img, gt_x)
+						step_losses['{:d}_re_ref_vgg'.format(pred_step)] =  self.VGGCosLoss(re_ref_img, gt_x, False)
+						x = torch.cat([x[:, 3:], re_ref_img], dim=1)
+					else:
+						x = torch.cat([x[:,3:], refine_imgs[-1]], dim=1)
 
 				self.sync(step_losses) # sum
 				for key in list(val_criteria.keys()):
 					val_criteria[key].update(step_losses[key].cpu().item(), size*self.args.gpus)
 
-				# if self.args.syn_type == 'extra':
-				# 	imgs = []
-				# 	segs = []
-				# 	img = img[0].unsqueeze(0)
-				# 	seg = seg[0].unsqueeze(0)
-				# 	x = x[0].unsqueeze(0)
-				# 	for i in range(self.args.extra_length):
-				# 		if i!=0:
-				# 			x = torch.cat([x[:,3:6], img, x[:, 26:46], seg_fil], dim=1).cuda(self.args.rank, non_blocking=True)
-				# 			img, seg = self.model(x)
-				# 		seg_fil = torch.argmax(seg, dim=1)
-				# 		seg_fil = transform_seg_one_hot(seg_fil, 20, cuda=True)*2-1
-				# 		imgs.append(img)
-				# 		segs.append(seg_fil)
-						
+
+
 				comp_time += time() - end
 				end = time()
 
@@ -844,40 +727,59 @@ class Refiner:
 						comp_time = 0
 						load_time = 0
 					if self.step % 1 == 0:
-						if not self.args.high_res:
-							image_set = self.prepare_image_set(data, coarse_img.cpu(), [ refined_img.cpu() for refined_img in refine_imgs], seg.cpu() if self.args.mode=='xs2xs' else None, flow=attn_flow)
+						if self.args.high_res:
+							image_set = self.prepare_image_sets(data, show_coarse_imgs, show_refine_imgs, show_segs, high_res_img=show_high_res_imgs)
+						elif self.args.re_ref:
+							image_set = self.prepare_image_sets(data, show_coarse_imgs, show_refine_imgs, show_segs, re_ref_imgs=show_re_ref_imgs)
 						else:
-							image_set = self.prepare_image_set(data, coarse_img.cpu(), [ refined_img.cpu() for refined_img in refine_imgs], seg.cpu() if self.args.mode=='xs2xs' else None, high_res_img=refined_h_img.cpu(), flow=attn_flow)
+							image_set = self.prepare_image_sets(data, show_coarse_imgs, show_refine_imgs, show_segs)
 						image_name = 'e{}_img_{}'.format(self.epoch, self.step)
 						self.writer.add_image(image_name, image_set, self.step)
 
 		if self.args.rank == 0:
+			logss=""
+			for i in range(self.args.vid_length):
+				logs ="pred {:d}".format(i)
+				if val_coarse:
+					coarse_logs = "\tcoarse L1: {l1:.3f}\tPSNR: {psnr:.3f}\tSSIM: {ssim:.3f}\tvgg: {vgg:.3f}\t".format(
+							l1=val_criteria['{:d}_l1'.format(i)].avg,
+							psnr=val_criteria['{:d}_psnr'.format(i)].avg,
+							ssim=val_criteria['{:d}_ssim'.format(i)].avg,
+							vgg = val_criteria['{:d}_vgg'.format(i)].avg,
+							iou = val_criteria['{:d}_iou'.format(i)].avg
+					)
+					if self.args.mode=='xs2xs':
+						coarse_logs+='iou: {iou:.3f}\n'.format(iou = val_criteria['{:d}_iou'.format(i)].avg)
+					logs += coarse_logs
 
-			logs = "refine L1: {r_l1:.4f}\tPSNR: {r_psnr:.4f}\tSSIM: {r_ssim:.4f}\tvgg: {r_vgg:.4f}".format(
-						r_l1=val_criteria['refine_l1'].avg,
-						r_psnr=val_criteria['refine_psnr'].avg,
-						r_ssim=val_criteria['refine_ssim'].avg,
-						r_vgg = val_criteria['refine_vgg'].avg
-				) + "\n"
+				logs += "\trefine L1: {r_l1:.3f}\tPSNR: {r_psnr:.3f}\tSSIM: {r_ssim:.3f}\tvgg: {r_vgg:.3f}\n".format(
+							r_l1=val_criteria['{:d}_refine_l1'.format(i)].avg,
+							r_psnr=val_criteria['{:d}_refine_psnr'.format(i)].avg,
+							r_ssim=val_criteria['{:d}_refine_ssim'.format(i)].avg,
+							r_vgg = val_criteria['{:d}_refine_vgg'.format(i)].avg
+					)
 
-			if val_coarse:
-				coarse_logs = "coarse L1: {l1:.4f}\tPSNR: {psnr:.4f}\tSSIM: {ssim:.4f}\tvgg: {vgg:.4f}".format(
-						l1=val_criteria['l1'].avg,
-						psnr=val_criteria['psnr'].avg,
-						ssim=val_criteria['ssim'].avg,
-						vgg = val_criteria['vgg'].avg
-				)
-				logs = coarse_logs + "\n" + logs
-			if self.args.high_res:
-				highres_logs = "highre L1: {h_l1:.4f}\tPSNR: {h_psnr:.4f}\tSSIM: {h_ssim:.4f}\tvgg: {h_vgg:.4f}".format(
-						h_l1=val_criteria['h_l1'].avg,
-						h_psnr=val_criteria['h_psnr'].avg,
-						h_ssim=val_criteria['h_ssim'].avg,
-						h_vgg = val_criteria['h_vgg'].avg
-				)
-				logs = logs + highres_logs + '\n'
 
-			logs = "Epoch [{epoch:d}]\n".format(epoch=self.epoch) + logs
+				if self.args.high_res:
+					highres_logs = "\thighre L1: {h_l1:.3f}\tPSNR: {h_psnr:.3f}\tSSIM: {h_ssim:.3f}\tvgg: {h_vgg:.3f}\n".format(
+							h_l1=val_criteria['{:d}_h_l1'.format(i)].avg,
+							h_psnr=val_criteria['{:d}_h_psnr'.format(i)].avg,
+							h_ssim=val_criteria['{:d}_h_ssim'.format(i)].avg,
+							h_vgg = val_criteria['{:d}_h_vgg'.format(i)].avg
+					)
+					logs += highres_logs
+
+				if self.args.re_ref:
+					re_ref_logs = "\tre_ref  L1: {h_l1:.3f}\tPSNR: {h_psnr:.3f}\tSSIM: {h_ssim:.3f}\tvgg: {h_vgg:.3f}\n".format(
+							h_l1=val_criteria['{:d}_re_ref_l1'.format(i)].avg,
+							h_psnr=val_criteria['{:d}_re_ref_psnr'.format(i)].avg,
+							h_ssim=val_criteria['{:d}_re_ref_ssim'.format(i)].avg,
+							h_vgg = val_criteria['{:d}_re_ref_vgg'.format(i)].avg
+					)
+					logs += re_ref_logs
+				logss+=logs
+
+			logs = "Epoch [{epoch:d}]\n".format(epoch=self.epoch) + logss
 			self.args.logger.info(logs)
 
 			tfb_info = {key:value.avg for key,value in val_criteria.items()}
@@ -930,33 +832,237 @@ class Refiner:
 						comp_time = 0
 						load_time = 0
 
-	def cycgen(self):
+	def mycycgen(self):
 		assert self.args.rank == 0 # only allow single worker
 		if self.args.syn_type == 'extra':
-			assert self.args.interval == 1
-			load_dir_split = 'gt'
-			save_dir_split = 'extra_x{}'.format(self.args.vid_length)
+			load_dir_split = 'extra_wing'
+			seg_load_dir_split = 'extra_wing/seg'
+			save_dir_split = 'extra_wing'#.format(int(self.args.interval), self.args.vid_length)
 		elif self.args.syn_type == 'inter':
-			save_dir_split = 'inter_x{:d}'.format(int(2/self.args.interval))
-			load_dir_split = 'inter_x{:d}'.format(int(1/self.args.interval)) if self.args.interval<1 else 'gt'
-		load_img_dir = 'cycgen/cityscape/{}x{}/{}'.format(self.args.input_h, self.args.input_w, load_dir_split)
-		save_img_dir = 'cycgen/cityscape/{}x{}/{}'.format(self.args.input_h, self.args.input_w, save_dir_split)
-
+			load_dir_split = 'extra_wing'
+			seg_load_dir_split = 'extra_wing/seg'
+			save_dir_split = 'extra_wing'
 		with open('/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl', 'rb') as f:
 			clips = pickle.load(f)
 			clips_dir = clips['val'][:61] # onlye generate 0-60
+
+		load_img_dir = 'cycgen/cityscape/{}x{}/{}'.format(self.args.input_h, self.args.input_w, load_dir_split)
+		save_img_dir = 'cycgen/cityscape/{}x{}/{}'.format(self.args.input_h, self.args.input_w, save_dir_split)
 		load_clip_dirs = [load_img_dir+'/'+clip_dir[0] for clip_dir in clips_dir]
+		if self.args.mode == 'xs2xs':
+			load_seg_dir = 'cycgen/cityscape/{}x{}/{}'.format(self.args.input_h, self.args.input_w, seg_load_dir_split)
+			save_seg_dir = 'cycgen/cityscape/{}x{}/{}/seg'.format(self.args.input_h, self.args.input_w, save_dir_split)
+			load_clip_seg_dirs = [load_seg_dir+'/'+clip_dir[0] for clip_dir in clips_dir]
+
+		for first_index in [25]:
+
+			# first_index   = 10
+			second_index    = first_index+2
+			# pred_index = 3
+
+			pred_index_name = first_index+1
+
+			end = time()
+			for clip_ind, load_clip_dir in enumerate(load_clip_dirs):
+				load_img_files = glob.glob(load_clip_dir+"/*.png")
+				load_img_files = [  load_clip_dir+'/{:0>2d}.0.png'.format(first_index),
+									load_clip_dir+'/{:0>2d}.0.png'.format(second_index) ]
+				# load_img_files.sort()
+				load_imgs = rgb_load(load_img_files)
+
+				if self.args.mode == 'xs2xs':
+					# load_seg_files = glob.glob(load_clip_seg_dirs[clip_ind]+"/*.png")
+					# load_seg_files.sort()
+					load_seg_files = [  load_clip_seg_dirs[clip_ind]+'/{:0>2d}.0.png'.format(first_index),
+										load_clip_seg_dirs[clip_ind]+'/{:0>2d}.0.png'.format(second_index) ]
+					load_segs = seg_load(load_seg_files)
+					load_segs = [ np.eye(20)[np.array(i)] for i in load_segs ] 
+
+				for i in range(len(load_imgs)):
+					load_imgs[i] = transforms.functional.normalize( 
+											transforms.functional.to_tensor(
+												load_imgs[i]
+											),  (0.5, 0.5, 0.5),(0.5, 0.5, 0.5)
+										).unsqueeze(0)
+
+					load_segs[i] = torch.from_numpy(
+												np.transpose(
+													load_segs[i], (2,0,1)
+													)
+												).float().unsqueeze(0)
+
+				# if self.args.syn_type=='inter':
+				#   # load data
+				#   input_imgs = load_imgs
+				#   input_len = len(input_imgs)
+				#   pred_img_name_prefix = '/'.join(load_img_files[0].split('/')[-4:-1])
+				#   save_img_prefix = save_img_dir + '/' + pred_img_name_prefix
+				#   if not os.path.exists(save_img_prefix):
+				#       os.makedirs(save_img_prefix)
+				#   for step in range(input_len-1):
+				#       prev_img_name = '/'.join(load_img_files[step].split('/')[-4:])
+				#       prev_img_ind  = prev_img_name.split('/')[-1][:-4]
+				#       pred_img_ind = str(float(prev_img_ind) + self.args.interval/2)
+				#       pred_img_ind_split = pred_img_ind.split('.')
+				#       pred_img_ind_int = '{:0>2d}'.format(int(pred_img_ind_split[0]))
+				#       pred_img_ind_split[0] = pred_img_ind_int
+				#       pred_img_ind = '.'.join(pred_img_ind_split)
+				#       pred_img_name = save_img_prefix + '/' + pred_img_ind+".png"
+
+				#       x = torch.cat(input_imgs[step:step+2], dim=1)
+				#       x = x.cuda(self.args.rank, non_blocking=True)
+				#       seg = None
+				#       fg_mask = None
+				#       gt_x = None
+				#       gt_seg =  None
+
+				#       coarse_img, refine_imgs, refined_h_img, seg, attn_flow = self.model(x, fg_mask, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
+				#       pred_img = refine_imgs[-1][0]
+				#       pred_img = self.normalize(pred_img)
+
+				#       save_image(pred_img, pred_img_name)
+				#   # save gt
+				#   for step in range(input_len):
+				#       load_img_name = '/'.join(load_img_files[step].split('/')[-4:])
+				#       save_img_name = save_img_dir + '/' + load_img_name
+				#       shutil.copyfile(load_img_files[step], save_img_name)
+
+				# elif self.args.syn_type == 'extra':
+				# load data
+				input_imgs = load_imgs #[ load_imgs[first_index],load_imgs[second_index] ] 
+
+				input_imgs = [t.cuda(self.args.rank) for t in input_imgs]
+				# img1_ind = float(load_img_files[0].split('/')[-1][:-4])
+				# img2_ind = float(load_img_files[int(self.args.interval)].split('/')[-1][:-4])
+				# time_interval = img2_ind - img1_ind
+				pred_img_name_prefix = '/'.join(load_img_files[0].split('/')[-4:-1])
+				save_img_prefix = save_img_dir + '/' + pred_img_name_prefix
+				if not os.path.exists(save_img_prefix):
+					os.makedirs(save_img_prefix)
+
+				# load seg
+				input_segs = load_segs #[ load_segs[first_index], load_segs[second_index] ]
+				input_segs = [t.cuda(self.args.rank) for t in input_segs]
+				pred_seg_name_prefix = '/'.join(load_seg_files[0].split('/')[-4:-1])
+				save_seg_prefix = save_seg_dir + '/' + pred_seg_name_prefix
+				if not os.path.exists(save_seg_prefix):
+					os.makedirs(save_seg_prefix)
+
+				# for step in range(self.args.vid_length):
+				input_segs = [t.cuda(self.args.rank) for t in input_segs]
+				pred_img_ind = pred_index_name #pred_img2_ind + (step+1)*time_interval
+				# following 5 lines make integer part _ _ 
+				pred_img_ind = str(pred_img_ind)
+				pred_img_ind_split = pred_img_ind.split('.')
+				pred_img_ind_int = '{:0>2d}.0'.format(int(pred_img_ind_split[0]))
+				pred_img_ind_split[0] = pred_img_ind_int
+				pred_img_ind = '.'.join(pred_img_ind_split)                 
+
+				pred_img_name = save_img_prefix + '/' + pred_img_ind+".png"
+				pred_seg_name = save_seg_prefix + '/' + pred_img_ind+".png"
+
+				x = torch.cat(input_imgs, dim=1)
+				x = x.cuda(self.args.rank, non_blocking=True)
+				seg = torch.cat(input_segs, dim=1)
+				fg_mask = None
+				gt_x = None
+				gt_seg =  None
+
+				coarse_img, refine_imgs, refined_h_img, re_ref_img, out_seg, attn_flow = self.model(x, fg_mask, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
+				if self.args.re_ref:
+					pred_img = re_ref_img
+				else:
+					pred_img = refine_imgs[-1]
+				# input_imgs = [input_imgs[1]] + [pred_img]
+				# input_segs = [input_segs[1]] + [F.softmax(out_seg, dim=1)]
+				save_image(out_seg.argmax(dim=1)[0].float()/255, pred_seg_name)
+
+				out_seg = torch.eye(20)[out_seg.argmax(dim=1)].permute(0,3,1,2).contiguous()
+				# input_segs = [input_segs[1]] + [out_seg]
+
+				pred_img = pred_img[0]
+				pred_img = self.normalize(pred_img)
+				save_image(pred_img, pred_img_name)
+
+				
+
+				# vis_out_seg = vis_seg_mask(out_seg, 20)
+				# pred_seg = vis_out_seg[0]
+				# save_image(pred_seg, pred_seg_name)
+
+				# save gt
+				# for step in range(2):
+				# load_img_name = '/'.join(load_img_files[first_index].split('/')[-4:])
+				# save_img_name = save_img_dir + '/' + load_img_name
+				# shutil.copyfile(load_img_files[first_index], save_img_name)
+				# if self.args.mode == 'xs2xs':
+				#   load_seg_name = '/'.join(load_seg_files[first_index].split('/')[-4:])
+				#   save_seg_name = save_seg_dir + '/' + load_seg_name
+				#   # vis_out_seg = vis_seg_mask(load_segs[first_index], 20)[0]
+				#   shutil.copyfile(load_seg_files[first_index], save_seg_name)
+
+				# load_img_name = '/'.join(load_img_files[second_index].split('/')[-4:])
+				# save_img_name = save_img_dir + '/' + load_img_name
+				# shutil.copyfile(load_img_files[second_index], save_img_name)
+				# if self.args.mode == 'xs2xs':
+				#   load_seg_name = '/'.join(load_seg_files[second_index].split('/')[-4:])
+				#   save_seg_name = save_seg_dir + '/' + load_seg_name
+				#   # vis_out_seg = vis_seg_mask(load_segs[second_index], 20)[0]
+				#   shutil.copyfile(load_seg_files[second_index], save_seg_name)
+
+				p_time = time() - end
+				end = time()
+				sys.stdout.write('\rprocessing {}/{} {}s {}'.format(clip_ind, 61, p_time, load_img_files[0]))           
+
+
+
+
+	def cycgen(self):
+		assert self.args.rank == 0 # only allow single worker
+		if self.args.syn_type == 'extra':
+			load_dir_split = 'gt'
+			seg_load_dir_split = 'gt_seg'
+			save_dir_split = 'extra_{}x{}'.format(int(self.args.interval), self.args.vid_length)
+		elif self.args.syn_type == 'inter':
+			save_dir_split = 'inter_x{:d}'.format(int(2/self.args.interval))
+			load_dir_split = 'inter_x{:d}'.format(int(1/self.args.interval)) if self.args.interval<1 else 'gt'
+		with open('/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl', 'rb') as f:
+			clips = pickle.load(f)
+			clips_dir = clips['val'][:61] # onlye generate 0-60
+
+		load_img_dir = 'cycgen/cityscape/{}x{}/{}'.format(self.args.input_h, self.args.input_w, load_dir_split)
+		save_img_dir = 'cycgen/cityscape/{}x{}/{}'.format(self.args.input_h, self.args.input_w, save_dir_split)
+		load_clip_dirs = [load_img_dir+'/'+clip_dir[0] for clip_dir in clips_dir]
+		if self.args.mode == 'xs2xs':
+			load_seg_dir = 'cycgen/cityscape/{}x{}/{}'.format(self.args.input_h, self.args.input_w, seg_load_dir_split)
+			save_seg_dir = 'cycgen/cityscape/{}x{}/{}/seg'.format(self.args.input_h, self.args.input_w, save_dir_split)
+			load_clip_seg_dirs = [load_seg_dir+'/'+clip_dir[0] for clip_dir in clips_dir]
+
 		end = time()
 		for clip_ind, load_clip_dir in enumerate(load_clip_dirs):
 			load_img_files = glob.glob(load_clip_dir+"/*.png")
 			load_img_files.sort()
 			load_imgs = rgb_load(load_img_files)
+
+			if self.args.mode == 'xs2xs':
+				load_seg_files = glob.glob(load_clip_seg_dirs[clip_ind]+"/*.png")
+				load_seg_files.sort()
+				load_segs = seg_load(load_seg_files)
+				load_segs = [ np.eye(20)[np.array(i)] for i in load_segs ] 
+
 			for i in range(len(load_imgs)):
 				load_imgs[i] = transforms.functional.normalize( 
 										transforms.functional.to_tensor(
 											load_imgs[i]
 										),  (0.5, 0.5, 0.5),(0.5, 0.5, 0.5)
 									).unsqueeze(0)
+
+				load_segs[i] = torch.from_numpy(
+											np.transpose(
+												load_segs[i], (2,0,1)
+												)
+											).float().unsqueeze(0)
+
 			if self.args.syn_type=='inter':
 				# load data
 				input_imgs = load_imgs
@@ -995,49 +1101,76 @@ class Refiner:
 
 			elif self.args.syn_type == 'extra':
 				# load data
-				input_imgs = load_imgs[:2]
+				input_imgs = load_imgs[:2*int(self.args.interval):int(self.args.interval)]
 				input_imgs = [t.cuda(self.args.rank) for t in input_imgs]
 				img1_ind = float(load_img_files[0].split('/')[-1][:-4])
-				img2_ind = float(load_img_files[1].split('/')[-1][:-4])
+				img2_ind = float(load_img_files[int(self.args.interval)].split('/')[-1][:-4])
 				time_interval = img2_ind - img1_ind
 				pred_img_name_prefix = '/'.join(load_img_files[0].split('/')[-4:-1])
 				save_img_prefix = save_img_dir + '/' + pred_img_name_prefix
 				if not os.path.exists(save_img_prefix):
-					os.makedirs(save_img_prefix)			
+					os.makedirs(save_img_prefix)
+
+				# load seg
+				input_segs = load_segs[:2*int(self.args.interval):int(self.args.interval)]
+				input_segs = [t.cuda(self.args.rank) for t in input_segs]
+				pred_seg_name_prefix = '/'.join(load_seg_files[0].split('/')[-4:-1])
+				save_seg_prefix = save_seg_dir + '/' + pred_seg_name_prefix
+				if not os.path.exists(save_seg_prefix):
+					os.makedirs(save_seg_prefix)
 
 				for step in range(self.args.vid_length):
+					input_segs = [t.cuda(self.args.rank) for t in input_segs]
 					pred_img_ind = img2_ind + (step+1)*time_interval
 					# following 5 lines make integer part _ _ 
 					pred_img_ind = str(pred_img_ind)
 					pred_img_ind_split = pred_img_ind.split('.')
 					pred_img_ind_int = '{:0>2d}'.format(int(pred_img_ind_split[0]))
 					pred_img_ind_split[0] = pred_img_ind_int
-					pred_img_ind = '.'.join(pred_img_ind_split)					
+					pred_img_ind = '.'.join(pred_img_ind_split)                 
 
 					pred_img_name = save_img_prefix + '/' + pred_img_ind+".png"
+					pred_seg_name = save_seg_prefix + '/' + pred_img_ind+".png"
 
 					x = torch.cat(input_imgs, dim=1)
 					x = x.cuda(self.args.rank, non_blocking=True)
-					seg = None
+					seg = torch.cat(input_segs, dim=1)
 					fg_mask = None
 					gt_x = None
 					gt_seg =  None
 
-					coarse_img, refine_imgs, refined_h_img, seg, attn_flow = self.model(x, fg_mask, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
-					pred_img = refine_imgs[-1]
+					coarse_img, refine_imgs, refined_h_img, re_ref_img, out_seg, attn_flow = self.model(x, fg_mask, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
+					if self.args.re_ref:
+						pred_img = re_ref_img
+					else:
+						pred_img = refine_imgs[-1]
 					input_imgs = [input_imgs[1]] + [pred_img]
+					input_segs = [input_segs[1]] + [F.softmax(out_seg, dim=1)]
+					out_seg = torch.eye(20)[out_seg.argmax(dim=1)].permute(0,3,1,2).contiguous()
+					# input_segs = [input_segs[1]] + [out_seg]
+
 					pred_img = pred_img[0]
 					pred_img = self.normalize(pred_img)
 					save_image(pred_img, pred_img_name)
+
+					vis_out_seg = vis_seg_mask(out_seg, 20)
+					pred_seg = vis_out_seg[0]
+					save_image(pred_seg, pred_seg_name)
+
 				# save gt
 				for step in range(2):
-					load_img_name = '/'.join(load_img_files[step].split('/')[-4:])
+					load_img_name = '/'.join(load_img_files[step*int(self.args.interval)].split('/')[-4:])
 					save_img_name = save_img_dir + '/' + load_img_name
-					shutil.copyfile(load_img_files[step], save_img_name)
+					shutil.copyfile(load_img_files[step*int(self.args.interval)], save_img_name)
+					if self.args.mode == 'xs2xs':
+						load_seg_name = '/'.join(load_seg_files[step*int(self.args.interval)].split('/')[-4:])
+						save_seg_name = save_seg_dir + '/' + load_seg_name
+						vis_out_seg = vis_seg_mask(load_segs[step*int(self.args.interval)], 20)[0]
+						save_image(vis_out_seg, save_seg_name)
 
 			p_time = time() - end
 			end = time()
-			sys.stdout.write('\rprocessing {}/{} {}s {}'.format(clip_ind, 61, p_time, load_img_files[0]))			
+			sys.stdout.write('\rprocessing {}/{} {}s {}'.format(clip_ind, 61, p_time, load_img_files[0]))           
 
 	def sync(self, loss_dict, mean=True):
 		'''Synchronize all tensors given using mean or sum.'''
@@ -1098,7 +1231,7 @@ class Refiner:
 						new_ckpt[key] = item
 				model_dict.update(new_ckpt)
 				self.model.module.load_state_dict(model_dict)
-			elif self.args.pretrained_low :#and not self.args.resume:
+			elif self.args.pretrained_low and not self.args.resume:
 				model_dict = self.model.module.state_dict()
 				new_ckpt = OrderedDict()
 				for key,item in ckpt['model'].items():

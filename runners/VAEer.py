@@ -20,7 +20,7 @@ from tensorboardX import SummaryWriter
 from torchvision.utils import make_grid
 # from utils import AverageMeter
 # from loss import CombinedLoss
-from losses import RGBLoss, PSNR, SSIM, IoU, GANLoss, VGGCosineLoss, losses_multigpu_only_mask
+from losses import RGBLoss, PSNR, SSIM, IoU, GANLoss, VGGCosineLoss#, losses_multigpu_only_mask
 import nets
 
 from data import get_dataset

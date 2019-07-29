@@ -16,6 +16,9 @@ from utils.net_utils import *
 
 from runners.trainer import Trainer
 from runners.VAEer import VAEer
+from runners.ExtraTrainer import ExtraTrainer
+from runners.InterTrainer import InterTrainer
+from runners.InterGANTrainer import InterGANTrainer
 from runners.ganer import GANer
 from runners.refiner import Refiner
 from runners.refiner_gan import RefinerGAN
@@ -62,12 +65,12 @@ def get_logger(path, rank=None):
 
 
 def worker(rank, args):
-	if args.split == 'train':
-		logger = get_logger(args.path + '/experiment.log',
-						rank) # process specific logger
-	else:
-		logger = get_logger(args.path + '/experiment_val.log',
-						rank) # process specific logger
+	# if args.split == 'train':
+	logger = get_logger(args.path + '/experiment_{}.log'.format(args.split),
+					rank) # process specific logger
+	# else:
+	# 	logger = get_logger(args.path + '/experiment_val.log',
+	# 					rank) # process specific logger
 	args.logger = logger
 	args.rank = rank
 	dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:%d' % args.port,
@@ -79,16 +82,14 @@ def worker(rank, args):
 	torch.manual_seed(args.seed)
 	torch.cuda.manual_seed_all(args.seed)
 
-	if args.runner =='gen':
-		trainer = Trainer(args)
-	elif args.runner =='gan':
-		trainer = GANer(args)
-	elif args.runner == 'vae':
-		trainer = VAEer(args)
-	elif args.runner == 'refine':
-		trainer = Refiner(args)
-	elif args.runner == 'refine_gan':
-		trainer = RefinerGAN(args)
+	if args.runner =='EXTRA':
+		trainer = ExtraTrainer(args)
+	elif args.runner =='INTER':
+		if args.gan:
+			trainer = InterGANTrainer(args)
+		else:
+			trainer = InterTrainer(args)
+		
 	else:
 		raise Exception("speficied runner does not exist !")
 
@@ -104,22 +105,8 @@ def worker(rank, args):
 		else:
 			trainer.validate()
 	elif args.split=='cycgen':
-		if args.cycgen_all:
-			clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl"
-			with open(clip_file, 'rb') as f:
-				clips = pickle.load(f)
-				clips = clips['val']
-			end = time()
-			for step, t in enumerate(clips):
-				if step > 60:
-					break
-				trainer.args.cyc_prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/leftImg8bit_sequence/' + t[0]
-				trainer.cycgen()
-				spend = time() -  end
-				end = time()
-				sys.stdout.write('\r {}/{} {} {:.2f}s'.format(step, len(clips), trainer.args.cyc_prefix, spend))
-		else:
-			trainer.cycgen()
+		assert args.cycgen_load_dir is not None, 'please specify cycgen load dir where to load data'
+		trainer.cycgen()		
 	elif args.split == 'train':
 		for epoch in range(trainer.epoch-1, args.epochs):
 			trainer.set_epoch(epoch)
@@ -131,14 +118,13 @@ def worker(rank, args):
 			if args.rank == 0:  # gpu id
 				trainer.save_checkpoint()
 
-
 def main():
 	parser = Options()
 	args = parser.parse()
 	
 	# exp path
 	args.path = get_exp_path(args)
-	if args.resume or args.split =='val' or ( args.runner == 'gan' and args.load_G):
+	if args.resume or args.split !='train': #=='val' or args.split == 'cycgen': #or ( args.runner == 'gan' and args.load_G) :
 		args.path = args.load_dir
 	else:
 		pathlib.Path(args.path).mkdir(parents=True, exist_ok=False)
@@ -152,11 +138,11 @@ def main():
 			args.port = int(s.getsockname()[1])
 
 	# logger
-	if args.split == 'val':
-		logger = get_logger(args.path + '/experiment_val.log') if args.interval == 2 else \
-					 get_logger(args.path + '/experiment_val_int_1.log')
-	else:
-		logger = get_logger(args.path + '/experiment.log')
+	# if args.split == 'val':
+	logger = get_logger(args.path + '/experiment_{}.log'.format(args.split)) #if args.interval == 2 else \
+	# get_logger(args.path + '/experiment_val_int_1.log')
+	# else:
+	# 	logger = get_logger(args.path + '/experiment.log')
 	logger.info('Start of experiment')
 	logger.info('=========== Initilized logger =============')
 	logger.info('\n\t' + '\n\t'.join('%s: %s' % (k, str(v))

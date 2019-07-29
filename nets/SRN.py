@@ -53,6 +53,18 @@ class encoder_layer3(nn.Module):
 	def forward(self, input):
 		return self.conv(input)
 
+class encoder_layer4(nn.Module):
+	def __init__(self, in_dim, out_dim, ks):
+		super(encoder_layer4, self).__init__()
+		self.conv = nn.Sequential(
+				nn.Conv2d(in_dim, out_dim, ks, stride=2, padding=ks//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(out_dim, out_dim, 3)
+			)
+
+	def forward(self, input):
+		return self.conv(input)
+
 class decoder_layer4(nn.Module):
 	def __init__(self, in_dim, out_dim, ks):
 		super(decoder_layer4, self).__init__()
@@ -327,9 +339,7 @@ class HResUnet(nn.Module):
 		return output
 
 
-
 ########### attention level 1 ############
-
 class AttnRefine(nn.Module):
 	def __init__(self, args):
 		super(AttnRefine, self).__init__()
@@ -620,7 +630,12 @@ class AttnRefineV2(nn.Module):
 
 		# calculate flow_map
 		flow_map = dis_map_1d.argmin(dim=4) 
-		flow_map = torch.stack([flow_map//self.w, flow_map%self.h], dim=2).float() # bs, 2, 2, H, W      w, h
+		# print("max", (flow_map//self.h).max())
+		# print("min", (flow_map%self.h).min())
+		flow_map = torch.stack([flow_map//self.h, flow_map%self.h], dim=2).float() # bs, 2, 2, H, W      w, h
+
+
+
 
 		h_w_add = torch.zeros(bs, 1, 2, H, W)
 		h_w_add[:,:,0,:,:] = self.w//2
@@ -639,15 +654,21 @@ class AttnRefineV2(nn.Module):
 		img2 = neighbors[:,3:6] 
 		x_f1, x_f2, x_f3 = self.resnet101(x)  # 16*32
 		x_cat_f = torch.cat([
-				x_f1, F.interpolate(x_f2, scale_factor=2, mode='bilinear', align_corners=True)
+				x_f1
+				# F.interpolate(x_f2, scale_factor=2, mode='bilinear', align_corners=True) 
+				# F.interpolate(x_f3, scale_factor=4, mode='bilinear', align_corners=True) # this part
 			], dim=1)
 		img1_f1, img1_f2, img1_f3 = self.resnet101(img1)
 		img1_cat_f = torch.cat([
-				img1_f1, F.interpolate(img1_f2, scale_factor=2, mode='bilinear', align_corners=True)
+				img1_f1
+				# F.interpolate(img1_f2, scale_factor=2, mode='bilinear', align_corners=True)
+				# F.interpolate(img1_f3, scale_factor=4, mode='bilinear', align_corners=True)
 			], dim=1)
 		img2_f1, img2_f2, img2_f3 = self.resnet101(img2)
 		img2_cat_f = torch.cat([
-				img2_f1, F.interpolate(img2_f2, scale_factor=2, mode='bilinear', align_corners=True)
+				img2_f1
+				# F.interpolate(img2_f2, scale_factor=2, mode='bilinear', align_corners=True)
+				# F.interpolate(img2_f3, scale_factor=4, mode='bilinear', align_corners=True)
 			], dim=1)
 
 		prob_map, flow_map = self.corrmap(x_cat_f, img1_cat_f, img2_cat_f)
@@ -683,6 +704,541 @@ class AttnRefineV2(nn.Module):
 		dec1_out = self.decoder_1(dec2_out+x_enc1)
 
 		return dec1_out, flow_map
+
+
+class AttnRefineV2O(nn.Module):
+	def __init__(self, args):
+		super(AttnRefineV2O, self).__init__()
+		self.encoder_1 = nn.Sequential(
+				nn.Conv2d(3, 32, 3, stride=1, padding=3//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3)          
+			)
+		self.encoder_2 = encoder_layer3(32, 64, 3)
+		self.encoder_3 = encoder_layer3(64, 128, 3) # 32*64
+		self.encoder_4 = encoder_layer3(128, 128, 3) # 16*32
+
+		self.mid = nn.Sequential(
+				nn.Conv2d(128*3, 128, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(128, 128, 3),
+				ResnetBlock(128, 128, 3)			
+			)
+
+		self.decoder_4 = decoder_layer5(128, 128, 4)
+		self.decoder_3 = decoder_layer5(128, 64, 4)
+		self.decoder_2 = decoder_layer5(64, 32, 4)
+		self.decoder_1 = decoder_layer_out(32, 3, 3)
+
+		self.w = 9
+		self.h = 5
+
+
+	def corrmap(self, x, t1, t2):
+		bs, c, H, W = x.size() # H = 16, W = 32
+		# x_pad = F.pad(x, pad=(self.w//2, self.w//2, self.h//2, self.h//2), value=0)
+		t = torch.cat([t1.unsqueeze(1), t2.unsqueeze(1)], dim=1) # bs, 2, c, H, W
+		t_pad = F.pad(t, pad=(self.w//2, self.w//2, self.h//2, self.h//2), value=-100) # set to -100 to enlarge distance
+
+		t_nns = t_pad.unfold(dimension=3, size=self.h, step=1)# bs, 2, c, H, W, h
+		t_nns = t_nns.unfold(dimension=4, size=self.w, step=1)# bs, 2, c, H, W, h, w
+		assert t_nns.size()[3:5] == (H, W), t_nns.size()
+
+		x_tf = x.view(bs, 1, c, H, W, 1, 1)
+
+		dis_map = torch.sum((t_nns - x_tf)**2, dim=2) # bs, 2, H, W, h, w
+		dis_map_1d = dis_map.view(bs, 2, H, W, self.h*self.w) # bs, 2, H, W, h*w
+
+		# calculate flow_map
+		flow_map = dis_map_1d.argmin(dim=4) 
+		# print("max", (flow_map//self.h).max())
+		# print("min", (flow_map%self.h).min())
+		flow_map = torch.stack([flow_map//self.h, flow_map%self.h], dim=2).float() # bs, 2, 2, H, W      w, h
+
+
+
+
+		h_w_add = torch.zeros(bs, 1, 2, H, W)
+		h_w_add[:,:,0,:,:] = self.w//2
+		h_w_add[:,:,1,:,:] = self.h//2
+		flow_map = flow_map.cpu() - h_w_add
+
+		# use soft attention
+		sim_map = 1./(dis_map_1d+1e-6) # bs, 2, H, W, h*w
+		prob_map = F.softmax(sim_map, dim=4) # bs, 2, H, W, h*w
+
+		return prob_map, flow_map
+
+	def forward(self, x, neighbors):
+
+		img1 = neighbors[:,:3]
+		img2 = neighbors[:,3:6] 
+		x_enc1 = self.encoder_1(x)
+		x_enc2 = self.encoder_2(x_enc1)
+		x_enc3 = self.encoder_3(x_enc2)
+		x_enc4 = self.encoder_4(x_enc3)
+
+		img1_enc1 = self.encoder_1(img1)
+		img1_enc2 = self.encoder_2(img1_enc1)
+		img1_enc3 = self.encoder_3(img1_enc2)
+		img1_enc4 = self.encoder_4(img1_enc3)
+
+		img2_enc1 = self.encoder_1(img2)
+		img2_enc2 = self.encoder_2(img2_enc1)
+		img2_enc3 = self.encoder_3(img2_enc2)
+		img2_enc4 = self.encoder_4(img2_enc3)
+
+
+		prob_map, flow_map = self.corrmap(x_enc4, img1_enc4, img2_enc4)
+
+		# enc4 feature fusion
+		enc4_fusion = torch.cat([img1_enc4.unsqueeze(1), img2_enc4.unsqueeze(1)], dim=1)
+		enc4_fusion_pad = F.pad(enc4_fusion, pad=(self.w//2, self.w//2, self.h//2, self.h//2), value=0)
+		enc4_fusion_patch = enc4_fusion_pad.unfold(dimension=3, size=self.h, step=1).unfold(dimension=4, size=self.w, step=1)# bs, 2, c, H, W, h, w
+		re_shape = list(enc4_fusion_patch.size()[:5]) + [self.h*self.w]
+		enc4_fusion_patch_weighted = (enc4_fusion_patch.contiguous().view(re_shape).contiguous()*prob_map.unsqueeze(2)).\
+											sum(dim=5) # bs, 2, c, H, W
+
+		mid_in = torch.cat([x_enc4, enc4_fusion_patch_weighted[:,0], enc4_fusion_patch_weighted[:, 1]], dim=1)
+		dec4_in = self.mid(mid_in) 
+		dec4_out = self.decoder_4(dec4_in)
+		dec3_out = self.decoder_3(dec4_out+x_enc3)
+		dec2_out = self.decoder_2(dec3_out+x_enc2)
+		dec1_out = self.decoder_1(dec2_out+x_enc1)
+
+		return dec1_out, flow_map
+
+
+class AttnRefineV2Base(nn.Module):
+	def __init__(self, args):
+		super(AttnRefineV2Base, self).__init__()
+		# resnet101 = torchvision.models.resnet101(pretrained=True)
+		# self.resnet101 = my_resnet101(resnet101)
+		# for param in self.resnet101.parameters():
+			# param.requires_grad = False
+
+		self.encoder_1 = nn.Sequential(
+				nn.Conv2d(3, 32, 3, stride=1, padding=3//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3)          
+			)
+		self.encoder_2 = encoder_layer3(32, 64, 3)
+		self.encoder_3 = encoder_layer3(64, 128, 3) # 32*64
+		self.encoder_4 = encoder_layer3(128, 128, 3) # 16*32
+
+		self.mid = nn.Sequential(
+				nn.Conv2d(128*3, 128, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(128, 128, 3),
+				ResnetBlock(128, 128, 3)			
+			)
+
+		self.decoder_4 = decoder_layer5(128, 128, 4)
+		self.decoder_3 = decoder_layer5(128, 64, 4)
+		self.decoder_2 = decoder_layer5(64, 32, 4)
+		self.decoder_1 = decoder_layer_out(32, 3, 3)
+
+		self.w = 9
+		self.h = 5
+		self.W = 32
+		self.H = 16
+
+
+	def forward(self, x, neighbors):
+
+		img1 = neighbors[:,:3]
+		img2 = neighbors[:,3:6] 
+		
+
+		x_enc1 = self.encoder_1(x)
+		x_enc2 = self.encoder_2(x_enc1)
+		x_enc3 = self.encoder_3(x_enc2)
+		x_enc4 = self.encoder_4(x_enc3)
+
+		img1_enc1 = self.encoder_1(img1)
+		img1_enc2 = self.encoder_2(img1_enc1)
+		img1_enc3 = self.encoder_3(img1_enc2)
+		img1_enc4 = self.encoder_4(img1_enc3)
+
+		img2_enc1 = self.encoder_1(img2)
+		img2_enc2 = self.encoder_2(img2_enc1)
+		img2_enc3 = self.encoder_3(img2_enc2)
+		img2_enc4 = self.encoder_4(img2_enc3)
+
+
+		mid_in = torch.cat([x_enc4, img1_enc4, img2_enc4], dim=1)
+		dec4_in = self.mid(mid_in) 
+		dec4_out = self.decoder_4(dec4_in)
+		dec3_out = self.decoder_3(dec4_out+x_enc3)
+		dec2_out = self.decoder_2(dec3_out+x_enc2)
+		dec1_out = self.decoder_1(dec2_out+x_enc1)
+
+		return dec1_out, None
+
+
+########### attention level 3 ###############
+class AttnRefineV3(nn.Module):
+	def __init__(self, args):
+		super(AttnRefineV3, self).__init__()
+		self.attn_encoder_1 = nn.Sequential(
+				nn.Conv2d(3, 32, 3, stride=1, padding=3//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3)          
+			)
+		self.attn_encoder_2 = encoder_layer3(32, 64, 3)	# 64 * 128
+		self.attn_encoder_3 = encoder_layer3(64, 64, 3)	# 32 * 64
+
+		self.img_encoder_1 = nn.Sequential(
+				nn.Conv2d(3, 32, 3, stride=1, padding=3//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3)          
+			)
+		self.img_encoder_2 = encoder_layer3(32, 64, 3)	# 64 * 128
+		self.img_encoder_3 = encoder_layer3(64, 64, 3)	# 32 * 64
+
+		self.mid = nn.Sequential(
+				nn.Conv2d(64*3, 128, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				nn.Conv2d(128, 64, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(64, 64, 3),
+				ResnetBlock(64, 64, 3)			
+			)
+
+		self.decoder_3 = decoder_layer5(64, 64, 4)
+		self.decoder_2 = decoder_layer5(64, 32, 4)
+		self.decoder_1 = decoder_layer_out(32, 3, 3)
+
+		self.w = 17
+		self.h = 9
+		self.W = 64
+		self.H = 32
+
+
+	def corrmap(self, x, t1, t2):
+		bs, c, H, W = x.size() # H = 32, W = 64
+
+		x_normed  = x/x.norm(dim=1, keepdim=True)
+		t1_normed = t1/t1.norm(dim=1, keepdim=True)
+		t2_normed = t2/t2.norm(dim=1, keepdim=True)
+
+		t = torch.cat([t1_normed.unsqueeze(1), t2_normed.unsqueeze(1)], dim=1) # bs, 2, c, H, W
+		t_pad = F.pad(t, pad=(self.w//2, self.w//2, self.h//2, self.h//2), value=-100) # set to -100 to enlarge distance
+
+		t_nns = t_pad.unfold(dimension=3, size=self.h, step=1)# bs, 2, c, H, W, h
+		t_nns = t_nns.unfold(dimension=4, size=self.w, step=1)# bs, 2, c, H, W, h, w
+		assert t_nns.size()[3:5] == (H, W), t_nns.size()
+
+		x_tf = x_normed.view(bs, 1, c, H, W, 1, 1)
+
+		sim_map = torch.sum(t_nns*x_tf, dim=2) # bs, 2, H, W, h, w
+		sim_map_1d = sim_map.view(bs, 2, H, W, self.h*self.w) # bs, 2, H, W, h*w
+
+		# calculate flow_map
+		flow_map = sim_map_1d.argmax(dim=4) 
+		flow_map = torch.stack([flow_map//self.h, flow_map%self.h], dim=2).float() # bs, 2, 2, H, W      w, h
+
+		h_w_add = torch.zeros(bs, 1, 2, H, W)
+		h_w_add[:,:,0,:,:] = self.w//2
+		h_w_add[:,:,1,:,:] = self.h//2
+		flow_map = flow_map.cpu() - h_w_add
+
+		prob_map = F.softmax(sim_map_1d, dim=4) # bs, 2, H, W, h*w
+
+		return prob_map, flow_map
+
+	def forward(self, x, neighbors):
+
+		img1 = neighbors[:,:3]
+		img2 = neighbors[:,3:6] 
+
+		x_attn_enc1 = self.attn_encoder_1(x)
+		x_attn_enc2 = self.attn_encoder_2(x_attn_enc1)
+		x_attn_enc3 = self.attn_encoder_3(x_attn_enc2)
+
+		img1_attn_enc1 = self.attn_encoder_1(img1)
+		img1_attn_enc2 = self.attn_encoder_2(img1_attn_enc1)
+		img1_attn_enc3 = self.attn_encoder_3(img1_attn_enc2)
+
+		img2_attn_enc1 = self.attn_encoder_1(img2)
+		img2_attn_enc2 = self.attn_encoder_2(img2_attn_enc1)
+		img2_attn_enc3 = self.attn_encoder_3(img2_attn_enc2)
+
+		prob_map, flow_map = self.corrmap(x_attn_enc3, img1_attn_enc3, img2_attn_enc3)
+
+
+		x_enc1 = self.img_encoder_1(x)
+		x_enc2 = self.img_encoder_2(x_enc1)
+		x_enc3 = self.img_encoder_3(x_enc2)
+
+		img1_enc1 = self.img_encoder_1(img1)
+		img1_enc2 = self.img_encoder_2(img1_enc1)
+		img1_enc3 = self.img_encoder_3(img1_enc2)
+
+		img2_enc1 = self.img_encoder_1(img2)
+		img2_enc2 = self.img_encoder_2(img2_enc1)
+		img2_enc3 = self.img_encoder_3(img2_enc2)
+
+		# enc4 feature fusion
+		enc3_fusion = torch.cat([img1_enc3.unsqueeze(1), img2_enc3.unsqueeze(1)], dim=1)
+		enc3_fusion_pad = F.pad(enc3_fusion, pad=(self.w//2, self.w//2, self.h//2, self.h//2), value=0)
+		enc3_fusion_patch = enc3_fusion_pad.unfold(dimension=3, size=self.h, step=1).unfold(dimension=4, size=self.w, step=1)# bs, 2, c, H, W, h, w
+		re_shape = list(enc3_fusion_patch.size()[:5]) + [self.h*self.w]
+		enc3_fusion_patch_weighted = (enc3_fusion_patch.contiguous().view(re_shape).contiguous()*prob_map.unsqueeze(2)).\
+											sum(dim=5) # bs, 2, c, H, W
+
+		mid_in = torch.cat([x_enc3, enc3_fusion_patch_weighted[:,0], enc3_fusion_patch_weighted[:, 1]], dim=1)
+		dec3_in = self.mid(mid_in) 
+		dec3_out = self.decoder_3(dec3_in)
+		dec2_out = self.decoder_2(dec3_out)
+		dec1_out = self.decoder_1(dec2_out)
+
+		return dec1_out, flow_map
+
+
+########### attention level 3 ###############
+class AttnRefineV3Base(nn.Module):
+	def __init__(self, args):
+		super(AttnRefineV3Base, self).__init__()
+		self.img_encoder_1 = nn.Sequential(
+				nn.Conv2d(3, 32, 3, stride=1, padding=3//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3)          
+			)
+		self.img_encoder_2 = encoder_layer3(32, 64, 3)	# 64 * 128
+		self.img_encoder_3 = encoder_layer3(64, 128, 3)	# 32 * 64
+
+		self.mid = nn.Sequential(
+				nn.Conv2d(128*3, 128, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				nn.Conv2d(128, 128, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(128, 128, 3),
+				ResnetBlock(128, 128, 3)			
+			)
+
+		self.decoder_3 = decoder_layer5(128, 64, 4)
+		self.decoder_2 = decoder_layer5(64, 32, 4)
+		self.decoder_1 = decoder_layer_out(32, 3, 3)
+
+		self.w = 17
+		self.h = 9
+		self.W = 64
+		self.H = 32
+
+	def forward(self, x, neighbors):
+
+		img1 = neighbors[:,:3]
+		img2 = neighbors[:,3:6] 
+
+		x_enc1 = self.img_encoder_1(x)
+		x_enc2 = self.img_encoder_2(x_enc1)
+		x_enc3 = self.img_encoder_3(x_enc2)
+
+		img1_enc1 = self.img_encoder_1(img1)
+		img1_enc2 = self.img_encoder_2(img1_enc1)
+		img1_enc3 = self.img_encoder_3(img1_enc2)
+
+		img2_enc1 = self.img_encoder_1(img2)
+		img2_enc2 = self.img_encoder_2(img2_enc1)
+		img2_enc3 = self.img_encoder_3(img2_enc2)
+
+		mid_in = torch.cat([x_enc3, img1_enc3, img2_enc3], dim=1)
+		dec3_in = self.mid(mid_in) 
+		dec3_out = self.decoder_3(dec3_in)
+		dec2_out = self.decoder_2(dec3_out)
+		dec1_out = self.decoder_1(dec2_out)
+
+		return dec1_out, None
+
+
+########### attention level 3 ###############
+class AttnRefineV4(nn.Module):
+	def __init__(self, args):
+		super(AttnRefineV4, self).__init__()
+		self.attn_encoder_1 = nn.Sequential(
+				nn.Conv2d(3, 64, 3, stride=1, padding=3//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(64, 64, 3)
+			)
+		self.attn_encoder_2 = encoder_layer3(64, 128, 3)	# 64 * 128
+
+		self.img_encoder_1 = nn.Sequential(
+				nn.Conv2d(3, 32, 3, stride=1, padding=3//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3)          
+			)
+		self.img_encoder_2 = encoder_layer3(32, 64, 3)	# 64 * 128
+		self.img_encoder_3 = encoder_layer3(64, 64, 3)	# 32 * 64
+
+		self.mid = nn.Sequential(
+				nn.Conv2d(64*3, 128, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				nn.Conv2d(128, 64, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(64, 64, 3),
+				ResnetBlock(64, 64, 3)			
+			)
+
+		self.decoder_3 = decoder_layer5(64, 64, 4)
+		self.decoder_2 = decoder_layer5(64, 32, 4)
+		self.decoder_1 = decoder_layer_out(32, 3, 3)
+
+		self.w = 17
+		self.h = 9
+		self.W = 64
+		self.H = 32
+
+
+	def corrmap(self, x, t1, t2):
+		bs, c, H, W = x.size() # H = 32, W = 64
+
+		x_normed  = x/x.norm(dim=1, keepdim=True)
+		t1_normed = t1/t1.norm(dim=1, keepdim=True)
+		t2_normed = t2/t2.norm(dim=1, keepdim=True)
+
+		t = torch.cat([t1_normed.unsqueeze(1), t2_normed.unsqueeze(1)], dim=1) # bs, 2, c, H, W
+		t_pad = F.pad(t, pad=(self.w//2, self.w//2, self.h//2, self.h//2), value=-100) # set to -100 to enlarge distance
+
+		t_nns = t_pad.unfold(dimension=3, size=self.h, step=1)# bs, 2, c, H, W, h
+		t_nns = t_nns.unfold(dimension=4, size=self.w, step=1)# bs, 2, c, H, W, h, w
+		assert t_nns.size()[3:5] == (H, W), t_nns.size()
+
+		x_tf = x_normed.view(bs, 1, c, H, W, 1, 1)
+
+		sim_map = torch.sum(t_nns*x_tf, dim=2) # bs, 2, H, W, h, w
+		sim_map_1d = sim_map.view(bs, 2, H, W, self.h*self.w) # bs, 2, H, W, h*w
+
+		# calculate flow_map
+		flow_map = sim_map_1d.argmax(dim=4) 
+		flow_map = torch.stack([flow_map//self.h, flow_map%self.h], dim=2).float() # bs, 2, 2, H, W      w, h
+
+		h_w_add = torch.zeros(bs, 1, 2, H, W)
+		h_w_add[:,:,0,:,:] = self.w//2
+		h_w_add[:,:,1,:,:] = self.h//2
+		flow_map = flow_map.cpu() - h_w_add
+
+		prob_map = F.softmax(sim_map_1d, dim=4) # bs, 2, H, W, h*w
+
+		return prob_map, flow_map
+
+	def forward(self, x, neighbors):
+
+		img1 = neighbors[:,:3]
+		img2 = neighbors[:,3:6] 
+
+		x_attn_enc1 = self.attn_encoder_1(x)
+		x_attn_enc2 = self.attn_encoder_2(x_attn_enc1)
+		x_attn_enc3 = self.attn_encoder_3(x_attn_enc2)
+
+		img1_attn_enc1 = self.attn_encoder_1(img1)
+		img1_attn_enc2 = self.attn_encoder_2(img1_attn_enc1)
+		img1_attn_enc3 = self.attn_encoder_3(img1_attn_enc2)
+
+		img2_attn_enc1 = self.attn_encoder_1(img2)
+		img2_attn_enc2 = self.attn_encoder_2(img2_attn_enc1)
+		img2_attn_enc3 = self.attn_encoder_3(img2_attn_enc2)
+
+		prob_map, flow_map = self.corrmap(x_attn_enc3, img1_attn_enc3, img2_attn_enc3)
+
+
+		x_enc1 = self.img_encoder_1(x)
+		x_enc2 = self.img_encoder_2(x_enc1)
+		x_enc3 = self.img_encoder_3(x_enc2)
+
+		img1_enc1 = self.img_encoder_1(img1)
+		img1_enc2 = self.img_encoder_2(img1_enc1)
+		img1_enc3 = self.img_encoder_3(img1_enc2)
+
+		img2_enc1 = self.img_encoder_1(img2)
+		img2_enc2 = self.img_encoder_2(img2_enc1)
+		img2_enc3 = self.img_encoder_3(img2_enc2)
+
+		# enc4 feature fusion
+		enc3_fusion = torch.cat([img1_enc3.unsqueeze(1), img2_enc3.unsqueeze(1)], dim=1)
+		enc3_fusion_pad = F.pad(enc3_fusion, pad=(self.w//2, self.w//2, self.h//2, self.h//2), value=0)
+		enc3_fusion_patch = enc3_fusion_pad.unfold(dimension=3, size=self.h, step=1).unfold(dimension=4, size=self.w, step=1)# bs, 2, c, H, W, h, w
+		re_shape = list(enc3_fusion_patch.size()[:5]) + [self.h*self.w]
+		enc3_fusion_patch_weighted = (enc3_fusion_patch.contiguous().view(re_shape).contiguous()*prob_map.unsqueeze(2)).\
+											sum(dim=5) # bs, 2, c, H, W
+
+		mid_in = torch.cat([x_enc3, enc3_fusion_patch_weighted[:,0], enc3_fusion_patch_weighted[:, 1]], dim=1)
+		dec3_in = self.mid(mid_in) 
+		dec3_out = self.decoder_3(dec3_in)
+		dec2_out = self.decoder_2(dec3_out)
+		dec1_out = self.decoder_1(dec2_out)
+
+		return dec1_out, flow_map
+
+########### attention level 3 ###############
+class AttnRefineV4Base(nn.Module):
+	def __init__(self, args):
+		super(AttnRefineV4Base, self).__init__()
+		self.img_encoder_1 = nn.Sequential(
+				nn.Conv2d(3, 32, 3, stride=1, padding=3//2),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3),
+				ResnetBlock(32, 32, 3)          
+			)
+		self.img_encoder_2 = encoder_layer3(32, 64, 3)	# 64 * 128
+		self.img_encoder_3 = encoder_layer3(64, 128, 3)	# 32 * 64
+
+		self.mid = nn.Sequential(
+				nn.Conv2d(128*3, 128, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				nn.Conv2d(128, 128, 3, stride=1, padding=1),
+				nn.LeakyReLU(0.2, inplace=True),
+				ResnetBlock(128, 128, 3),
+				ResnetBlock(128, 128, 3)			
+			)
+
+		self.decoder_3 = decoder_layer5(128, 64, 4)
+		self.decoder_2 = decoder_layer5(64, 32, 4)
+		self.decoder_1 = decoder_layer_out(32, 3, 3)
+
+		self.w = 17
+		self.h = 9
+		self.W = 64
+		self.H = 32
+
+	def forward(self, x, neighbors):
+
+		img1 = neighbors[:,:3]
+		img2 = neighbors[:,3:6] 
+
+		x_enc1 = self.img_encoder_1(x)
+		x_enc2 = self.img_encoder_2(x_enc1)
+		x_enc3 = self.img_encoder_3(x_enc2)
+
+		img1_enc1 = self.img_encoder_1(img1)
+		img1_enc2 = self.img_encoder_2(img1_enc1)
+		img1_enc3 = self.img_encoder_3(img1_enc2)
+
+		img2_enc1 = self.img_encoder_1(img2)
+		img2_enc2 = self.img_encoder_2(img2_enc1)
+		img2_enc3 = self.img_encoder_3(img2_enc2)
+
+		mid_in = torch.cat([x_enc3, img1_enc3, img2_enc3], dim=1)
+		dec3_in = self.mid(mid_in) 
+		dec3_out = self.decoder_3(dec3_in)
+		dec2_out = self.decoder_2(dec3_out)
+		dec1_out = self.decoder_1(dec2_out)
+
+		return dec1_out, None
+
 
 ########### multiscale conv ############
 class MSConv2d(nn.Module):
@@ -810,10 +1366,6 @@ class MSBaseRefine(nn.Module):
 
 		cnt_end = time()
 		return [out], None, None
-
-
-
-
 
 
 

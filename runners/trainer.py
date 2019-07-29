@@ -41,11 +41,9 @@ class Trainer:
         self.args = args
 
         args.logger.info('Initializing trainer')
-        # if not os.path.isdir('../predict'):       only used in validation
-        #     os.makedirs('../predict')
         self.model = get_model(args)
         params_cnt = count_parameters(self.model)
-        print("params ", params_cnt)
+        args.logger.info("params "+str(params_cnt))
         torch.cuda.set_device(args.rank)
         self.model.cuda(args.rank)
         self.model = torch.nn.parallel.DistributedDataParallel(self.model,
@@ -54,7 +52,7 @@ class Trainer:
 
         if args.split == 'train':
             # train loss
-            self.RGBLoss = RGBLoss(args, sharp=True)
+            self.RGBLoss = RGBLoss(args, sharp=False)
             self.SegLoss = nn.CrossEntropyLoss()
             self.RGBLoss.cuda(args.rank)
             self.SegLoss.cuda(args.rank)
@@ -91,9 +89,10 @@ class Trainer:
             self.load_checkpoint()
 
         if args.rank == 0:
-            writer_name = args.path+'/{}_int_{}_{}_logs'.format(self.args.split, self.args.interval, self.args.dataset)
+            writer_name = args.path+'/{}_int_{}_len_{}_{}_logs'.format(self.args.split, int(self.args.interval), self.args.vid_length, self.args.dataset)
             self.writer = SummaryWriter(writer_name)
 
+        self.stand_heat_map = self.create_stand_heatmap()
 
     def set_epoch(self, epoch):
         self.args.logger.info("Start of epoch %d" % (epoch+1))
@@ -104,53 +103,153 @@ class Trainer:
         if self.args.syn_type == 'extra':
             x = torch.cat([data['frame1'], data['frame2']], dim=1)
             seg = torch.cat([data['seg1'], data['seg2']], dim=1) if self.args.mode == 'xs2xs' else None
-            mask = torch.cat([data['fg_mask1'],data['fg_mask2']], dim=1) if self.args.mode == 'xs2xs' else None
-            gt_x = data['frame3']
-            gt_seg = data['seg3'] if self.args.mode == 'xs2xs' else None
+            gt_x = [ data['frame'+str(i+3)] for i in range(self.args.vid_length) ]
+            gt_seg = [ data['seg'+str(i+3)] if self.args.mode == 'xs2xs' else None for i in range(self.args.vid_length) ]
+            return x, seg, gt_x, gt_seg
         else:
             x = torch.cat([data['frame1'], data['frame3']], dim=1)
             seg = torch.cat([data['seg1'], data['seg3']], dim=1) if self.args.mode == 'xs2xs' else None
-            mask = torch.cat([data['fg_mask1'],data['fg_mask3']], dim=1) if self.args.mode == 'xs2xs' else None
             gt_x = data['frame2'] 
             gt_seg = data['seg2']  if self.args.mode == 'xs2xs' else None
-        return x, seg, mask, gt_x, gt_seg    
+            return x, seg,  gt_x, gt_seg    
 
     def normalize(self, img):
         return (img+1)/2
 
-    def prepare_image_set(self, data, img, seg, extra=False):
-        view_rgbs = [   self.normalize(data['frame1'][0]), 
-                        self.normalize(data['frame2'][0]), 
-                        self.normalize(data['frame3'][0])   ]
-        if self.args.mode == 'xs2xs':
-            view_segs = [vis_seg_mask(data['seg'+str(i)][0].unsqueeze(0), 20).squeeze(0) for i in range(1, 4)]
-        else:
-            view_segs = []
+    def create_stand_heatmap(self):
+        heatmap = torch.zeros(3, 128, 256)
+        for i in range(256):
+            heatmap[0, :, i] = max(0, 1 - 2.*i/256)
+            heatmap[1, :, i] = max(0, 2.*i/256 - 1)
+            heatmap[2, :, i] = 1-heatmap[0, :, i]-heatmap[1, :, i]
+        return heatmap
 
-        if not extra:
-            insert_index = 2 
-            pred_rgb = self.normalize(img[0])
-            view_rgbs.insert(insert_index, pred_rgb)
+    def create_heatmap(self, prob_map):
+        c, h, w = prob_map.size()
+        assert c==1, c
+        assert h==128, h
+        rgb_prob_map = torch.zeros(3, h, w)
+        minimum, maximum = 0.0, 1.0
+        ratio = 2 * (prob_map-minimum) / (maximum - minimum)
+
+        rgb_prob_map[0] = 1-ratio
+        rgb_prob_map[1] = ratio-1
+        rgb_prob_map[:2].clamp_(0,1)
+        rgb_prob_map[2] = 1-rgb_prob_map[0]-rgb_prob_map[1]
+        return rgb_prob_map
+
+    def prepare_image_set(self, data, imgs, segs, masks=None, inpaints=None):
+        if self.args.syn_type == 'extra':
+            assert len(imgs) == self.args.num_pred_step*self.args.num_pred_once
+            num_pred_imgs = self.args.num_pred_step*self.args.num_pred_once
+            view_gt_rgbs = [ self.normalize(data['frame'+str(i+1)][0]) for i in range(num_pred_imgs+2)]
+            view_gt_segs = [ vis_seg_mask(data['seg'+str(i+1)][0].unsqueeze(0), 20).squeeze(0) for i in range(num_pred_imgs+2)]
+
+            black_img = torch.zeros_like(view_gt_rgbs[0])
+
+            view_pred_imgs =  [black_img]*2
+            view_pred_imgs += [self.normalize(img[0]) for img in imgs]
+
+            view_pred_segs =  [black_img]*2
+            view_pred_segs += [vis_seg_mask(seg[0].unsqueeze(0), 20).squeeze(0) for seg in segs]
+
+            view_imgs = view_gt_rgbs + view_pred_imgs + view_gt_segs + view_pred_segs
+
+            if self.args.inpaint:
+                view_inpaint_imgs =  [black_img]*2
+                view_inpaint_imgs += [self.normalize(img[0]) for img in inpaints]
+
+                view_inpaint_masks =  [black_img, self.stand_heat_map]
+                view_inpaint_masks += [ self.create_heatmap(img[0]) for img in masks]
+
+                view_imgs+=view_inpaint_imgs
+                view_imgs+=view_inpaint_masks
+
+            write_in_img = make_grid(view_imgs, nrow=num_pred_imgs+2)
+
+        else:
+            view_rgbs = [   self.normalize(data['frame1'][0]), 
+                            self.normalize(data['frame2'][0]), 
+                            self.normalize(data['frame3'][0])   ]
             if self.args.mode == 'xs2xs':
-                pred_seg = vis_seg_mask(seg[0].unsqueeze(0), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
-                view_segs.insert(insert_index, pred_seg)
-            write_in_img = make_grid(view_rgbs + view_segs, nrow=4)
-        else:
-            pass
-            # view_rgbs.insert(3, torch.zeros_like(view_rgbs[-1]))
-            # view_segs.insert(3, torch.zeros_like(view_segs[-1]))
+                view_segs = [vis_seg_mask(data['seg'+str(i)][0].unsqueeze(0), 20).squeeze(0) for i in range(1, 4)]
+            else:
+                view_segs = []
 
-            # view_pred_rgbs = []
-            # view_pred_segs = []
-            # for i in range(self.args.extra_length):
-            #     pred_rgb = self.normalize(img[i][0].cpu())
-            #     pred_seg = vis_seg_mask(seg[i].cpu(), 20).squeeze(0) if self.args.mode == 'xs2xs' else torch.zeros_like(view_segs[0])
-            #     view_pred_rgbs.append(pred_rgb)
-            #     view_pred_segs.append(pred_seg)
-            # write_in_img = make_grid(view_rgbs + view_segs + view_pred_rgbs + view_pred_segs, nrow=4)
+            black_img = torch.zeros_like(view_rgbs[0])
 
-        
+            pred_rgb = self.normalize(imgs[0])
+            view_rgbs.insert(2, pred_rgb)
+
+            if self.args.mode=='xs2xs':
+                pred_seg = vis_seg_mask(segs[0].unsqueeze(0), 20).squeeze(0)
+                view_segs.insert(2, pred_seg)
+            write_in_img = make_grid(view_rgbs + view_segs, nrow=4)            
+
         return write_in_img
+
+
+    def get_loss_record_dict(self,prefix=''):
+        D = {'{}_data_cnt'.format(prefix):0,
+            '{}_all_loss_record'.format(prefix):0}
+        if self.args.syn_type == 'extra':
+            for i in range(self.args.num_pred_step*self.args.num_pred_once):
+                d = {
+                '{}_frame_{}_l1_loss_record'.format(prefix, i+1):0,
+                '{}_frame_{}_ssim_loss_record'.format(prefix, i+1):0,
+                '{}_frame_{}_gdl_loss_record'.format(prefix, i+1):0,
+                '{}_frame_{}_vgg_loss_record'.format(prefix, i+1):0,
+                '{}_frame_{}_ce_loss_record'.format(prefix, i+1):0,
+                '{}_frame_{}_all_loss_record'.format(prefix, i+1):0
+                }
+                D.update(d)
+                if self.args.inpaint:
+                    d = {
+                    '{}_frame_{}_inpaint_l1_loss_record'.format(prefix, i+1):0,
+                    '{}_frame_{}_inpaint_gdl_loss_record'.format(prefix, i+1):0,
+                    '{}_frame_{}_inpaint_mask_loss_record'.format(prefix, i+1):0,
+                    '{}_frame_{}_inpaint_all_loss_record'.format(prefix, i+1):0
+                    }
+                    D.update(d)
+        else:
+            d = {
+                '{}_l1_loss_record'.format(prefix):0,
+                '{}_ssim_loss_record'.format(prefix):0,
+                '{}_gdl_loss_record'.format(prefix):0,
+                '{}_vgg_loss_record'.format(prefix):0,
+                '{}_ce_loss_record'.format(prefix):0,
+                '{}_all_loss_record'.format(prefix):0
+                }
+            D.update(d)
+        return D
+
+    def update_loss_record_dict(self, record_dict, loss_dict, batch_size):
+        record_dict['step_data_cnt']+=batch_size
+        if self.args.syn_type == 'extra':
+            for i in range(self.args.num_pred_step):
+                for j in range(self.args.num_pred_once):
+                    frame_ind = 1+i*self.args.num_pred_once + j
+                    for loss_name in ['l1', 'gdl', 'ssim', 'vgg', 'ce']:
+                        record_dict['step_frame_{}_{}_loss_record'.format(frame_ind, loss_name)] += \
+                                        batch_size*loss_dict['step_{}_frame_{}_{}_loss'.format(i, j, loss_name)].item()
+                        record_dict['step_frame_{}_all_loss_record'.format(frame_ind)] += \
+                                        batch_size*loss_dict['step_{}_frame_{}_{}_loss'.format(i, j, loss_name)].item()
+                    if self.args.inpaint:
+                        frame_ind = 1+i*self.args.num_pred_once + j
+                        for loss_name in ['l1', 'gdl', 'mask']:
+                            record_dict['step_frame_{}_inpaint_{}_loss_record'.format(frame_ind, loss_name)] += \
+                                            batch_size*loss_dict['step_{}_frame_{}_inpaint_{}_loss'.format(i, j, loss_name)].item()
+                            record_dict['step_frame_{}_inpaint_all_loss_record'.format(frame_ind)] += \
+                                            batch_size*loss_dict['step_{}_frame_{}_inpaint_{}_loss'.format(i, j, loss_name)].item()
+
+        else:
+            for loss_name in ['l1', 'gdl', 'ssim', 'vgg', 'ce']:
+                record_dict['step_{}_loss_record'.format(loss_name)] += \
+                                            batch_size*loss_dict['{}_loss'.format(loss_name)].item()
+                record_dict['step_all_loss_record'.format(frame_ind)] += \
+                                        batch_size*loss_dict['{}_loss'.format(loss_name)].item()
+        record_dict['step_all_loss_record']+=batch_size*loss_dict['loss_all'].item()
+        return record_dict
 
     def train(self):
         self.args.logger.info('Training started')
@@ -158,20 +257,9 @@ class Trainer:
         end = time()
         load_time = 0
         comp_time = 0
-        l1_loss_record = 0
-        ssim_loss_record = 0
-        vgg_loss_record = 0
-        ce_loss_record = 0
 
-        loss_all_record = 0
-        data_all_count = 0
-        epoch_data_all_count = 0
-
-        epoch_l1_loss_record = 0
-        epoch_ssim_loss_record = 0
-        epoch_vgg_loss_record = 0
-        epoch_loss_all_record = 0
-        epoch_ce_loss_record = 0
+        step_loss_record_dict = self.get_loss_record_dict('step')
+        epoch_loss_record_dict = self.get_loss_record_dict('epoch')
 
         for step, data in enumerate(self.train_loader):
             self.step = step
@@ -179,22 +267,74 @@ class Trainer:
             end = time()
             # for tensorboard
             self.global_step += 1
-            # forward pass
-            x, seg, fg_mask, gt_x, gt_seg = self.get_input(data)
-            x = x.cuda(self.args.rank, non_blocking=True)
-            seg = seg.cuda(self.args.rank, non_blocking=True)  if self.args.mode == 'xs2xs' else None
-            fg_mask = fg_mask.cuda(self.args.rank, non_blocking=True) if self.args.mode == 'xs2xs' else None
-            gt_seg = gt_seg.cuda(self.args.rank, non_blocking=True) if self.args.mode == 'xs2xs' else None
-            gt_x = gt_x.cuda(self.args.rank, non_blocking=True)
-            
-            batch_size_p = x.size(0)
-            data_all_count += batch_size_p
-            epoch_data_all_count += batch_size_p
 
-            img, seg = self.model(x, fg_mask)
-            loss_dict = self.RGBLoss(img, gt_x, False)
-            if self.args.mode == 'xs2xs':
-               loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(seg, torch.argmax(gt_seg, dim=1))   
+            batch_size_p = data['frame1'].size(0)
+
+            if self.args.syn_type == 'inter':
+                x, seg, gt_x, gt_seg = self.get_input(data)
+                x = x.cuda(self.args.rank, non_blocking=True)
+                gt_x = gt_x.cuda(self.args.rank, non_blocking=True)
+                if self.args.mode =='xs2xs':
+                    seg = seg.cuda(self.args.rank, non_blocking=True)
+                    gt_seg = gt_seg.cuda(self.args.rank, non_blocking=True)
+
+                out_img, out_seg = self.model(x, seg, gt_x, gt_seg)
+                loss_dict = self.RGBLoss(out_img, gt_x, False)
+                if self.args.mode == 'xs2xs':
+                   loss_dict['ce_loss'] = self.args.ce_weight*self.SegLoss(out_seg, torch.argmax(gt_seg, dim=1))   
+
+            else:
+                loss_dict = OrderedDict()
+                output_imgs = []
+                output_inpaints = []
+                output_masks = []
+                output_segs = []
+                last_rgb_output = torch.cat([data['frame1'], data['frame2']], dim=1).cuda(self.args.rank, non_blocking=True)
+                last_seg_output = torch.cat([data['seg1'], data['seg2']], dim=1).cuda(self.args.rank, non_blocking=True)
+                if self.args.num_pred_step > 1:
+                    assert self.args.num_pred_once == 1
+                for i in range(self.args.num_pred_step):
+                    gt_start_frame_ind = 3+i*self.args.num_pred_once
+                    gt_x = torch.cat([data['frame'+str(i)] 
+                                         for i in range(gt_start_frame_ind, gt_start_frame_ind+self.args.num_pred_once)], dim=1)\
+                                                .cuda(self.args.rank, non_blocking=True)
+                    gt_seg = gt_rgb = torch.cat([data['seg'+str(i)] 
+                                         for i in range(gt_start_frame_ind, gt_start_frame_ind+self.args.num_pred_once)], dim=1)\
+                                                .cuda(self.args.rank, non_blocking=True)
+
+                    x = last_rgb_output
+                    seg = last_seg_output
+                    if self.args.fix_init_frames:
+                        x = torch.cat([data['frame2'].detach().cuda(self.args.rank, non_blocking=True), x], dim=1)
+                        seg = torch.cat([data['seg2'].detach().cuda(self.args.rank, non_blocking=True), seg], dim=1)
+
+                    if self.args.inpaint:
+                        out_img, out_seg, mask, inpainted_img = self.model(x, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
+                    else:
+                        out_img, out_seg = self.model(x, seg=seg, gt_x=gt_x, gt_seg=gt_seg)
+                    for j in range(self.args.num_pred_once):
+                        prefix='step_{}_frame_{}'.format(i,j)
+                        loss_dict.update(self.coarse_RGBLoss(out_img[:,j*3:j*3+3], gt_x[:,j*3:j*3+3], False, prefix=prefix))
+                        loss_dict[prefix+'_ce_loss'] = self.args.ce_weight*self.SegLoss(out_seg[:,j*20:j*20+20], torch.argmax(gt_seg[:,j*20:j*20+20], dim=1))   
+                        output_imgs.append(coarse_img[:,j*3:j*3+3])
+                        output_segs.append(out_seg[:,j*20:j*20+20])
+
+                        if self.args.inpaint:
+                            prefix='step_{}_frame_{}_inpaint'.format(i,j)
+                            loss_dict.update(self.coarse_RGBLoss(inpainted_img[:,j*3:j*3+3]*(1-mask[:,j:j+1]), gt_x[:,j*3:j*3+3]*(1-mask[:,j:j+1]), False, prefix=prefix))
+                            loss_dict[prefix+'_mask_loss'] = 80*mask[:,j:j+1].mean()
+                            output_masks.append(mask[:,j:j+1])
+                            output_inpaints.append(inpainted_img[:,j*3:j*3+3])
+
+
+                    # following will only matter when num_pred_once == 1
+                    if self.args.num_pred_step == 1:
+                        break
+                    back_img = inpainted_img if self.args.inpaint else out_img
+                    last_rgb_output = torch.cat( [ x[:,-3:], back_img ], dim=1) 
+                    last_seg_output = torch.cat( [ seg[:,-20:], 
+                                                    torch.eye(20)[out_seg.argmax(dim=1)].permute(0,3,1,2).contiguous().cuda(self.args.rank, non_blocking=True)], dim=1)
+ 
             # loss and accuracy
             loss = 0
             for i in loss_dict.values():

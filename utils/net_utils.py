@@ -12,8 +12,10 @@ def preprocess_norm(input_tensor, cuda=True):
 	'''
 
 	'''
-	mean_arr = torch.tensor([-0.03,-0.088,-0.188])[None,:,None,None]
-	std_arr = torch.tensor([0.458,0.448,0.450])[None,:,None,None]
+	# mean_arr = torch.tensor([-0.03,-0.088,-0.188])[None,:,None,None]
+	# std_arr = torch.tensor([0.458,0.448,0.450])[None,:,None,None]
+	mean_arr = torch.tensor([0.485,0.456,0.406])[None,:,None,None]
+	std_arr = torch.tensor([0.229, 0.224, 0.225])[None,:,None,None]
 	if cuda:
 		device = input_tensor.get_device()
 		mean_arr = mean_arr.cuda(device)

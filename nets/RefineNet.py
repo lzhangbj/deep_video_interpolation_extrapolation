@@ -21,38 +21,24 @@ class RefineNet(nn.Module):
 		if args.re_ref:
 			self.re_ref_model = nets.__dict__[args.re_ref_model](args)
 
-	def forward(self, input, fg_mask=None, gt=None, seg=None, gt_x=None, gt_seg=None):
-		# if not self.args.high_res:
-		# 	coarse_rgb, output_seg = self.coarse_model(input)
-		# 	if self.training:
-		# 		refine_rgbs, _ = self.refine_model(coarse_rgb.detach(), gt[:, 3:23], input[:,:6])
-		# 	else:
-		# 		refine_rgbs, _ = self.refine_model(coarse_rgb.detach(), output_seg, input[:,:6])
+	def forward(self, input, seg=None, gt_x=None, gt_seg=None): # remove fg_mask and gt
+		low_input = torch.cat([input, seg], dim=1) if self.args.mode == 'xs2xs' else input
+
+		if self.args.syn_type == 'extra':
+			if self.args.inpaint:
+				coarse_rgb, output_seg, mask, inpainted_rgb = self.coarse_model(low_input)
+				return coarse_rgb, output_seg, mask, inpainted_rgb
+			else:
+				coarse_rgb, output_seg = self.coarse_model(low_input)
+				return coarse_rgb, output_seg 
 			
-		# 	return coarse_rgb, refine_rgbs, output_seg
+		else: # inter
+			if self.training:
+				if not self.args.lock_refine:
+					refine_rgbs, low_feature = self.refine_model(coarse_rgb, gt_seg, input) #.detach()
+			else:
+				refine_rgbs, low_feature= self.refine_model(coarse_rgb, output_seg, input) #.detach()
+			return coarse_rgb, output_seg
 
-		# else:
-		input_x_scaled = F.interpolate(input, scale_factor=0.5, mode='bilinear', align_corners=True) if self.args.high_res else input
-		# print('x',input_x_scaled.size())
-		# print('seg',seg.size())
-		low_input = torch.cat([input_x_scaled, seg], dim=1) if self.args.mode == 'xs2xs' else input_x_scaled
-		coarse_rgb, output_seg = self.coarse_model(low_input)
-
-		if self.training:
-			refine_rgbs, low_feature, flow = self.refine_model(coarse_rgb, gt_seg, input_x_scaled) #.detach()
-		else:
-			refine_rgbs, low_feature, flow = self.refine_model(coarse_rgb, output_seg, input_x_scaled) #.detach()
-
-		re_refine_rgb = None
-		if self.args.re_ref:
-			re_refine_rgb, flow = self.re_ref_model(refine_rgbs[-1].detach(), input_x_scaled)
-
-		# high res generator
-		high_res_rgb = None
-		if self.args.high_res:
-			high_res_rgb = self.high_res_model(refine_rgbs[-1], low_feature.detach(), input)
-
-		return  coarse_rgb, refine_rgbs, high_res_rgb, re_refine_rgb, output_seg, flow
-
-		
+			
 
