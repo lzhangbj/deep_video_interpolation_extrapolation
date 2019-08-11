@@ -21,6 +21,13 @@ from .InterRefineNet import InterRefineNet, InterStage3Net
 from .InterGANNet import InterGANNet
 from .FrameDisc import FrameDiscriminator, FrameLocalDiscriminator, FrameSNDiscriminator, FrameSNLocalDiscriminator
 from .VidDisc import VideoDiscriminator, VideoLocalDiscriminator, VideoSNDiscriminator, VideoSNLocalDiscriminator
-from .DetDisc import FrameDetDiscriminator, VideoDetDiscriminator, FrameSNDetDiscriminator, VideoSNDetDiscriminator, VideoLSSNDetDiscriminator
+from .DetDisc import FrameDetDiscriminator, VideoDetDiscriminator, \
+					FrameSNDetDiscriminator, VideoSNDetDiscriminator, \
+					FrameLSSNDetDiscriminator, \
+					VideoLSSNDetDiscriminator, VideoVecSNDetDiscriminator,VideoPoolSNDetDiscriminator, \
+					VideoGlobalZeroSNDetDiscriminator, VideoGlobalResSNDetDiscriminator, \
+					VideoGlobalMaskSNDetDiscriminator, VideoGlobalCoordSNDetDiscriminator
 from .SpectralNorm import SpectralNorm
+from .OpticalUnet import OpticalRefineNet, OpticalUnet, RefineUnet
+from .TrackGen import TrackGen, TrackGenV2
 

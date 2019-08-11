@@ -1,0 +1,17 @@
+steps to get tracking bboxes data
+1. use faster rcnn to detect bboxes --- already done
+2. into pysot
+	1) change input interval clip pkl file
+	2) change params
+	3) cmd
+		cd /data/linz/proj/Dataset/pysot
+		conda activate pysot
+		export PYTHONPATH=/data/linz/proj/Dataset/pysot:$PYTHONPATH
+		CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 python tools/mydemo.py \
+		    --config experiments/siamrpn_mobilev2_l234_dwxcorr/config.yaml \
+		    --snapshot experiments/siamrpn_mobilev2_l234_dwxcorr/model.pth \
+		    --seq --interval 5 --seq_ind (0-15)
+3. into dist_proj
+	1> temp_move in create_vid_files.py
+	2> create bbox_file and clean bbox_file to get 4bb.pkl
+4. change params in data.py and folder.py

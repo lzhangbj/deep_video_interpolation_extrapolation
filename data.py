@@ -22,10 +22,10 @@ def get_dataset(args):
 	### explicitly set flip = True #######
 	if args.dataset == "cityscape":
 		# if 'Det' in args.frame_disc_model or 'Det' in args.video_disc_model or args.frame_det_disc or args.video_det_disc:
-		clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/int_{}_len_3_4bb_extra_lsclip.pkl".format(int(args.interval))
-		if args.split == 'val':
-			clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/int_{}_len_3_extra_lsclip.pkl".format(int(args.interval))
-		obj_coord_file = "/data/linz/proj/Dataset/Cityscape/obj_coords/int_{}_len_3_extra_512x1024_4bb_lsclip.pkl".format(int(args.interval))
+		clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/int_{}_len_3_max_{}bb_area_3000_extra_panet_lsclip.pkl".format(int(args.interval), int(args.num_track_per_img))
+		# if not args.track_gen and args.split == 'val':
+		# 	clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/int_{}_len_3_extra_lsclip.pkl".format(int(args.interval))
+		obj_coord_file = "/data/linz/proj/Dataset/Cityscape/obj_coords/int_{}_len_3_extra_512x1024_max_{}bb_area_3000_panet_lsclip.pkl".format(int(args.interval), int(args.num_track_per_img))
 		if args.syn_type == 'extra' and args.vid_length != 1:
 			clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/int_{}_len_{}_extra_lsclip.pkl".format(int(args.interval), args.vid_length+2)
 		if args.effec_flow:
@@ -41,6 +41,10 @@ def get_dataset(args):
 			load_f = pickle.load(f)
 			if args.split == 'train':
 				coords_train_file = load_f['train'] 
+			if args.split == 'val':
+				coords_val_file = load_f['val']
+			# else:
+			# 	coords_val_file = None
 
 		crop_size = (args.input_h, args.input_w)
 		if args.split == 'train':
@@ -65,7 +69,7 @@ def get_dataset(args):
 			tfs.append(transforms.Compose([		#transforms.Resize((128, 256), interpolation=Image.NEAREST)
 													]))
 
-			val_dataset   = ImageFolder(args, clips_val_file, transform=tfs)
+			val_dataset   = ImageFolder(args, clips_val_file, transform=tfs, bboxes = coords_val_file)
 		else:
 			val_dataset=None
 	elif args.dataset == "ucf101":

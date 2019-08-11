@@ -7,6 +7,7 @@ from PIL import Image
 import sys
 import os
 import collections
+from time import time
 import cv2
 from os.path import isfile, join
 from utils.data_utils import color_map
@@ -38,7 +39,6 @@ def record_eff_img(store_dir):
 			store_dict[type].append(name)
 	with open(store_dir, 'wb') as f:
 		pickle.dump(store_dict, f)
-
 # record_eff_img('large_optical_flow.pkl') 
 
 def check_record(dir):
@@ -47,9 +47,7 @@ def check_record(dir):
 
 	print("train\t{} {:.4f}".format(len(file['train']), len(file['train'])/(2975*28)))
 	print("val\t{} {:.4f}".format(len(file['val']), len(file['val'])/(500*28)))
-
 # check_record('/data/linz/proj/Dataset/Cityscape/optical_flow/effec_optical_flow.pkl')
-
 
 def filter_load_file(load_file_dir, flow_file_dir, effec_load_file_dir):
 	with open(load_file_dir, 'rb') as f:
@@ -73,11 +71,9 @@ def filter_load_file(load_file_dir, flow_file_dir, effec_load_file_dir):
 
 	with open(effec_load_file_dir, 'wb') as f:
 		pickle.dump(effec_load_file, f)
-
 # filter_load_file('/data/linz/proj/Dataset/Cityscape/load_files/int_1_len_3_extra_lsclip.pkl',
 #               '/data/linz/proj/Dataset/Cityscape/optical_flow/effec_optical_flow.pkl',
 #               '/data/linz/proj/Dataset/Cityscape/load_files/effec_flow_int_1_len_3_extra_lsclip.pkl')
-
 
 def test_flow(dir):
 	files = glob.glob(dir+'/*/*.npy')
@@ -88,9 +84,7 @@ def test_flow(dir):
 		print(np.max(flow_image))
 		print(np.min(flow_image))
 		break
-
 # test_flow('/data/agong/train/flow_npz')
-
 
 def rec_region(dir):
 	names = glob.glob("{}/*/*.npy".format(dir), recursive=True)
@@ -107,7 +101,6 @@ def rec_region(dir):
 		# w_max = np.max(invalid_w)
 
 		# print(h_min, w_min, h_max, w_max)
-
 # rec_region('/data/agong/train/large_flow')
 
 def imgs2vid(pathIn, fps, res, interval=2):
@@ -201,8 +194,6 @@ def imgs2vid(pathIn, fps, res, interval=2):
 		# writing to a image array
 		out.write(frame_array[i])
 	out.release()
-
-
 # clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl"
 # with open(clip_file, 'rb') as f:
 #   clips = pickle.load(f)
@@ -221,8 +212,8 @@ def make_vid_dirs(res):
 	with open(clip_file, 'rb') as f:
 		clips = pickle.load(f)
 		clips = clips['val']
-	prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/leftImg8bit_sequence'
-	save_dir = 'cycgen/cityscape/{:d}x{:d}/gt'.format(res[1], res[0])
+	prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/leftImg8bit_sequence'#_{}x{}'.format(res[1], res[0])
+	save_dir = 'cycgen/cityscape/{:d}x{:d}/gt_nearest/rgb'.format(res[1], res[0])
 	for clip_cnt, clip in enumerate(clips):
 		if clip_cnt > 60:
 			break
@@ -240,12 +231,11 @@ def make_vid_dirs(res):
 			with open(img_dir, 'rb') as f:
 				img = Image.open(f)
 				img = img.convert('RGB')
-			img_resize = img.resize(res, Image.BILINEAR)
+			img = img.resize(res, Image.NEAREST)
 			save_img_name = os.path.join(save_clip_dir, "{:0>2d}.0.png".format(cnt))
-			img_resize.save(save_img_name)
+			img.save(save_img_name)
 		sys.stdout.write('\r saving {} {}'.format(clip_cnt, save_img_name))
-
-# make_vid_dirs((256, 128))
+# make_vid_dirs((128, 128))
 
 def make_vid_seg_dirs(res):
 	res_str = "{}x{}".format(res[1], res[0])
@@ -253,8 +243,8 @@ def make_vid_seg_dirs(res):
 	with open(clip_file, 'rb') as f:
 		clips = pickle.load(f)
 		clips = clips['val']
-	prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/gtFine_myseg_id_sequence_128x256'
-	save_dir = 'cycgen/cityscape/{:d}x{:d}/gt_seg'.format(res[1], res[0])
+	prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/gtFine_myseg_id_sequence'#.format(res[1], res[0])
+	save_dir = 'cycgen/cityscape/{:d}x{:d}/gt_nearest/seg'.format(res[1], res[0])
 	for clip_cnt, clip in enumerate(clips):
 		if clip_cnt > 60:
 			break
@@ -272,46 +262,83 @@ def make_vid_seg_dirs(res):
 			with open(img_dir, 'rb') as f:
 				img = Image.open(f)
 				img = img.convert('L')
-			# img_resize = img.resize(res, Image.NEAREST)
+			img = img.resize(res, Image.NEAREST)
 			save_img_name = os.path.join(save_clip_dir, "{:0>2d}.0.png".format(cnt))
 			img.save(save_img_name)
 		sys.stdout.write('\r saving {} {}'.format(clip_cnt, save_img_name))
+# make_vid_seg_dirs((128, 128))
 
-# make_vid_seg_dirs((256, 128))
-
-def resize_imgs(res):
+def resize_segs(mode_name, res):
 	res_str = "{}x{}".format(res[1], res[0])
 	clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl"
 	with open(clip_file, 'rb') as f:
-		clips = pickle.load(f)
-	clips = clips['val']
-	# prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/leftImg8bit_sequence'
-	prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/gtFine_myseg_id_sequence'
-	# save_dir = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/leftImg8bit_sequence_{:d}x{:d}'.format(res[1], res[0])
-	save_dir = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/gtFine_myseg_id_sequence_{:d}x{:d}'.format(res[1], res[0])
-	for clip_cnt, clip in enumerate(clips):
-		# make clip dir
-		start_img_dir = clip[0]
-		clip_dir = '/'.join(start_img_dir.split('/')[:-1])
-		save_clip_dir = os.path.join(save_dir, clip_dir)
-		if not os.path.exists(save_clip_dir):
-			os.makedirs(save_clip_dir)
-		# load images
-		for cnt, img_name in enumerate(clip):
-			# img_dir = os.path.join(prefix, img_name+"_leftImg8bit.png")
-			img_dir = os.path.join(prefix, img_name+"_gtFine_myseg_id.png")
-			with open(img_dir, 'rb') as f:
-				img = Image.open(f)
-				img = img.convert('RGB')
-			# img_resize = img.resize(res, Image.BILINEAR)
-			img_resize = img.resize(res, Image.NEAREST)
-			# save_img_name = os.path.join(save_dir, img_name+"_leftImg8bit.png")
-			save_img_name = os.path.join(save_dir, img_name+"_gtFine_myseg_id.png")
-			img_resize.save(save_img_name)
-		sys.stdout.write('\r saving {}/{} {}'.format(clip_cnt, len(clips), save_img_name))
-	print()
+		clipss = pickle.load(f)
+	for name in [mode_name]:
+		clips = clipss[name]
+		prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/gtFine_myseg_id_sequence'
+		save_dir = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/gtFine_myseg_id_sequence_{:d}x{:d}'.format(res[1], res[0])
+		s_time = time()
+		a_time = 0
+		for clip_cnt, clip in enumerate(clips):
+			# make clip dir
+			start_img_dir = clip[0]
+			clip_dir = '/'.join(start_img_dir.split('/')[:-1])
+			save_clip_dir = os.path.join(save_dir, clip_dir)
+			if not os.path.exists(save_clip_dir):
+				os.makedirs(save_clip_dir)
+			# load images
+			for cnt, img_name in enumerate(clip):
+				img_dir = os.path.join(prefix, img_name+"_gtFine_myseg_id.png")
+				with open(img_dir, 'rb') as f:
+					img = Image.open(f)
+					img = img.convert('L')
+				img_resize = img.resize(res, Image.NEAREST)
+				save_img_name = os.path.join(save_dir, img_name+"_gtFine_myseg_id.png")
+				img_resize.save(save_img_name)
+			e_time = time()
+			cost_time = e_time-s_time
+			a_time += cost_time
+			s_time = time()
+			save_img_name = '/'.join(save_img_name.split('/')[-4:])
+			sys.stdout.write('\r {}/{} {} c{:.1f} t{:.1f}'.format(clip_cnt, len(clips), save_img_name, cost_time, a_time))
+		print() 
+# resize_segs('train', (300, 300))
 
-# resize_imgs((256, 128))
+def resize_imgs(mode_name, res):
+	res_str = "{}x{}".format(res[1], res[0])
+	clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl"
+	with open(clip_file, 'rb') as f:
+		clipss = pickle.load(f)
+	for name in [mode_name]:
+		clips = clipss[name]
+		prefix = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/leftImg8bit_sequence'
+		save_dir = '/data/linz/proj/Dataset/Cityscape/leftImg_sequence/leftImg8bit_sequence_{:d}x{:d}'.format(res[1], res[0])
+		s_time = time()
+		a_time = 0
+		for clip_cnt, clip in enumerate(clips):
+			# make clip dir
+			start_img_dir = clip[0]
+			clip_dir = '/'.join(start_img_dir.split('/')[:-1])
+			save_clip_dir = os.path.join(save_dir, clip_dir)
+			if not os.path.exists(save_clip_dir):
+				os.makedirs(save_clip_dir)
+			# load images
+			for cnt, img_name in enumerate(clip):
+				img_dir = os.path.join(prefix, img_name+"_leftImg8bit.png")
+				with open(img_dir, 'rb') as f:
+					img = Image.open(f)
+					img = img.convert('RGB')
+				img_resize = img.resize(res, Image.BILINEAR)
+				save_img_name = os.path.join(save_dir, img_name+"_leftImg8bit.png")
+				img_resize.save(save_img_name)
+			e_time = time()
+			cost_time = e_time-s_time
+			a_time += cost_time
+			s_time = time()
+			save_img_name = '/'.join(save_img_name.split('/')[-4:])
+			sys.stdout.write('\r {}/{} {} c{:.1f} t{:.1f}'.format(clip_cnt, len(clips), save_img_name, cost_time, a_time))
+		print()
+resize_imgs('val', (1024, 512))
 
 def png_folder_2_avi(png_folder, out_folder, fps):
 	o_f = '/'.join(out_folder.split('/')[:-1])
@@ -334,7 +361,6 @@ def png_folder_2_avi(png_folder, out_folder, fps):
 		# writing to a image array
 		out.write(frame_array[i])
 	out.release()
-
 # clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl"
 # with open(clip_file, 'rb') as f:
 # 	clips = pickle.load(f)
@@ -364,10 +390,6 @@ def seg_id_to_rgb(seg_folder, out_folder):
 		img_rgb = Image.fromarray(img_rgb)
 		# cv2.imwrite(save_name,img_rgb)
 		img_rgb.save(save_name)
-
-
-
-
 # clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl"
 # with open(clip_file, 'rb') as f:
 # 	clips = pickle.load(f)
@@ -379,8 +401,6 @@ def seg_id_to_rgb(seg_folder, out_folder):
 # 	seg_id_to_rgb("cycgen/cityscape/{}/extra_wing/seg/{}".format(res, clip[0]), 
 # 					"cycgen/cityscape/{}/extra_wing/seg_rgb/{}".format(res, clip[0]))
 # 	sys.stdout.write("\r {} / 60".format(step))
-
-
 
 def combine_inter_avi():
 	fps = 17*8
@@ -460,23 +480,23 @@ def combine_inter_avi():
 		out.release()
 		sys.stdout.write("\r {}/61".format(step+1))
 	print()
-
 # combine_inter_avi()
 
-
-
-def combine_extra_avi_v1():
-	fps = 17
+def combine_extra_avi_v1(res, interval, leng):
+	fps = 17*3
 	clip_file = "/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl"
 	with open(clip_file, 'rb') as f:
 	  clips = pickle.load(f)
 	  clips = clips['val'][:61]
 
 	# gt_dir = '/data/linz/dist_proj/cycgen/cityscape/128x256/gt'
-	extra_dir = '/data/linz/dist_proj/cycgen/cityscape/128x256/extra_wing'
-	extra_seg_dir = '/data/linz/dist_proj/cycgen/cityscape/128x256/extra_wing/seg_rgb'
+	extra_dir = '/data/linz/dist_proj/log/ExtraNet_xs2xs_extra_1_07-12-01:28:00/cycgen/cityscape/{}x{}/extra_int_{}_len_{}_nearest/rgb'.format(res[1], res[0], interval, leng)
+	extra_seg_dir = '/data/linz/dist_proj/log/ExtraNet_xs2xs_extra_1_07-12-01:28:00/cycgen/cityscape/{}x{}/extra_int_{}_len_{}_nearest/vis_seg'.format(res[1], res[0], interval, leng)
 
-	out_folder = '/data/linz/dist_proj/cycgen/cityscape/128x256/extra_wing/comb_v2'
+	out_folder = '/data/linz/dist_proj/log/ExtraNet_xs2xs_extra_1_07-12-01:28:00/cycgen/cityscape/{}x{}/extra_int_{}_len_{}_nearest/comb'.format(res[1], res[0], interval, leng)
+
+	resize_h = res[1]
+	resize_w = 2*res[0] if res[1] == res[0] else res[0]
 
 	for step, clip in enumerate(clips):
 		clip_dir = clip[0]
@@ -484,24 +504,26 @@ def combine_extra_avi_v1():
 		extra_clip_dir = os.path.join(extra_dir, clip_dir)
 		extra_files = glob.glob(extra_clip_dir+'/*.png')
 		extra_files.sort()
-		assert len(extra_files) == 28
-		for i in range(28):
+		length = len(extra_files)
+		for i in range(length):
 			img = cv2.imread(extra_files[i])
+			img = cv2.resize(img, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
 			extra_files[i] = img
 
 		extra_seg_clip_dir = os.path.join(extra_seg_dir, clip_dir)
 		extra_seg_files = glob.glob(extra_seg_clip_dir+'/*.png')
 		extra_seg_files.sort()
-		assert len(extra_seg_files) == 28
-		for i in range(28):
+		assert len(extra_seg_files) == length
+		for i in range(length):
 			img = cv2.imread(extra_seg_files[i])
+			img = cv2.resize(img, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
 			extra_seg_files[i] = img
 
 		height, width, layers = extra_files[-1].shape
 		size = (width,height)
 
 		comb_frame_array = []
-		for frame_ind in range(28):
+		for frame_ind in range(length):
 			img = np.concatenate([extra_files[frame_ind], extra_seg_files[frame_ind]], axis=0)
 			comb_frame_array.append(img)
 
@@ -517,8 +539,7 @@ def combine_extra_avi_v1():
 		out.release()
 		sys.stdout.write("\r {}/61".format(step+1))
 	print()
-
-combine_extra_avi_v1()
+# combine_extra_avi_v1((128, 128), 3, 16)
 
 def combine_extra_avi():
 	fps = 17/3
@@ -527,10 +548,10 @@ def combine_extra_avi():
 	  clips = pickle.load(f)
 	  clips = clips['val'][:61]
 
-	gt_dir = '/data/linz/dist_proj/cycgen/cityscape/128x256/gt'
-	extra_dir = '/data/linz/dist_proj/cycgen/cityscape/128x256/extra_x28'
+	gt_dir = '/data/linz/dist_proj/cycgen/cityscape/128x128/gt'
+	extra_dir = '/data/linz/dist_proj/cycgen/cityscape/128x128/extra_x28'
 
-	out_folder = '/data/linz/dist_proj/cycgen/cityscape/128x256/extra_comb'
+	out_folder = '/data/linz/dist_proj/cycgen/cityscape/128x128/extra_comb'
 
 	for step, clip in enumerate(clips):
 		clip_dir = clip[0]
@@ -572,6 +593,5 @@ def combine_extra_avi():
 		out.release()
 		sys.stdout.write("\r {}/61".format(step+1))
 	print()
-
 # combine_extra_avi()
 

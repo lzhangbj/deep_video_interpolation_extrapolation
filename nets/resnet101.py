@@ -14,8 +14,8 @@ class my_resnet101(nn.Module):
 		x = self.resnet101.maxpool(x)
 
 		x = self.resnet101.layer1(x)
-		x1 = self.resnet101.layer2(x)
-		x2 = self.resnet101.layer3(x1)
-		x3 = self.resnet101.layer4(x2)
+		x1 = self.resnet101.layer2(x) 	# 512
+		x2 = self.resnet101.layer3(x1)	# 1024
+		x3 = self.resnet101.layer4(x2)	# 2048
 
 		return x1, x2, x3

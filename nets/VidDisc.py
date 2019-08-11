@@ -148,7 +148,6 @@ class VideoSNDiscriminator(nn.Module):
 
 				SpectralNorm(nn.Conv2d(32, 64, 5, 1, 2)),
 				nn.LeakyReLU(0.2,inplace=False),
-
 				SpectralNorm(nn.Conv2d(64, 32, 3, 1, 1)),
 				nn.LeakyReLU(0.2,inplace=False),
 
@@ -158,32 +157,29 @@ class VideoSNDiscriminator(nn.Module):
 				ResnetSNBlock(32, 32, 3),
 				# ResnetBlock(32, 32, 3),
 
-
 				# downsize 2 64*32*32
 				SpectralNorm(nn.Conv2d(32, 64, 3, 2, 1)),
 				nn.LeakyReLU(0.2, inplace=True),
 				ResnetSNBlock(64, 64, 3),
-				# ResnetBlock(64, 64, 3),
 				# downsize 3 128*16*16
 				SpectralNorm(nn.Conv2d(64, 128, 3, 2, 1)),
 				nn.LeakyReLU(0.2, inplace=True),
 				ResnetSNBlock(128, 128, 3),
-				# ResnetBlock(128, 128, 3),
 				# downsize 4 256*8*8
-				SpectralNorm(nn.Conv2d(128, 256, 3, 2, 1)),
-				nn.LeakyReLU(0.2, inplace=True),
-				# ResnetBlock(256, 256, 3),
-				ResnetSNBlock(256, 256, 3),
+				# SpectralNorm(nn.Conv2d(128, 256, 3, 2, 1)),
+				# nn.LeakyReLU(0.2, inplace=True),
+				# ResnetSNBlock(256, 256, 3),
 				# out layer
-				SpectralNorm(nn.Conv2d(256, 256, 3, 1, 1)),
+				SpectralNorm(nn.Conv2d(128, 128, 3, 1, 1)),
+				# SpectralNorm(nn.Conv2d(256, 256, 3, 1, 1)),
 				# nn.Tanh(),
-				nn.AvgPool2d(8)
+				nn.AvgPool2d(16)
 			)
 
 	def forward(self, x, seg, input_x, input_seg, bboxes=None):
 		input = torch.cat([x, seg, input_x, input_seg], dim=1) if self.args.seg_disc else torch.cat([x, input_x], dim=1)
 		output = self.layer(input)
-		output = output.view(-1, 256).mean(dim=1)
+		output = output.view(-1, 128).mean(dim=1)
 		return output
 
 class VideoSNLocalDiscriminator(nn.Module):

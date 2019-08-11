@@ -143,9 +143,21 @@ class Options():
 												help='training optimizer loss weigh of feat',
 												type=float,
 												default=20) 
+		self.parser.add_argument('--track_obj_loss', dest='track_obj_loss',
+										help='whether load coarse model ', 
+										action='store_true')      
+		self.parser.add_argument('--track_obj_w', dest='track_obj_weight',
+												help='training optimizer loss weigh of feat',
+												type=float,
+												default=80) 
+
 		self.parser.add_argument('--vid_len', dest='vid_length', 
 												type=int,
 												default=1, 
+												help='predicted video length')
+		self.parser.add_argument('--n_track', dest='num_track_per_img', 
+												type=int,
+												default=4, 
 												help='predicted video length')
 
 		self.parser.add_argument('--highres_large', dest='highres_large',
@@ -255,9 +267,6 @@ class Options():
 		inter_parser.add_argument('--coarse_lr', dest='coarse_learning_rate', 
 										help='coarse learning rate',
 										default=0.001, type=float)	
-		inter_parser.add_argument('--highres_large', dest='highres_large',
-												help='whether load coarse model ', 
-												action='store_true')
 		inter_parser.add_argument('--load_coarse', dest='load_coarse',
 												help='whether load coarse model ', 
 												action='store_true')
@@ -271,6 +280,18 @@ class Options():
 		inter_parser.add_argument('--seg_disc', dest='seg_disc',
 												help='whether train coarse model ', 
 												action='store_true')
+
+		inter_parser.add_argument('--track_gen', dest='track_gen',
+												help='whether train coarse model ', 
+												action='store_true')
+		inter_parser.add_argument('--track_gen_model', dest='track_gen_model', 
+										default='TrackGen', 
+										help='model to use',
+										choices=['TrackGen','TrackGenV2'])  
+		inter_parser.add_argument('--loc_diff_w', dest='loc_diff_weight', 
+										help='coarse learning rate',
+										default=100, type=float)
+
 
 		### refine model settings ###
 		inter_parser.add_argument('--refine', dest='refine', 
@@ -400,13 +421,13 @@ class Options():
 										help='refine model to use',
 										choices=['FrameDiscriminator', 'FrameLocalDiscriminator', 
 												'FrameSNDiscriminator', 'FrameSNLocalDiscriminator', 
-												'FrameDetDiscriminator', 'FrameSNDetDiscriminator'])  
+												'FrameDetDiscriminator', 'FrameSNDetDiscriminator','FrameLSSNDetDiscriminator'])  
 		inter_parser.add_argument('--frame_det_disc_model', dest='frame_det_disc_model', 
 										default='FrameDiscriminator', 
 										help='refine model to use',
 										choices=['FrameDiscriminator', 'FrameLocalDiscriminator', 
 												'FrameSNDiscriminator', 'FrameSNLocalDiscriminator', 
-												'FrameDetDiscriminator', 'FrameSNDetDiscriminator'])
+												'FrameDetDiscriminator', 'FrameSNDetDiscriminator','FrameLSSNDetDiscriminator'])
 		inter_parser.add_argument('--frame_det_disc_d_w', dest='frame_det_disc_disc_weight', 
 										help='whether refine or not',
 										type=float,
@@ -440,14 +461,14 @@ class Options():
 										choices=['VideoDiscriminator', 'VideoLocalDiscriminator', 
 												'VideoSNDiscriminator', 'VideoSNLocalDiscriminator', 
 												'VideoDetDiscriminator','VideoSNDetDiscriminator',
-												'VideoLSSNDetDiscriminator'])  
+												'VideoLSSNDetDiscriminator','VideoVecSNDetDiscriminator','VideoPoolSNDetDiscriminator'])  
 		inter_parser.add_argument('--video_disc_model', dest='video_disc_model', 
 										default='VideoDiscriminator', 
 										help='refine model to use',
 										choices=['VideoDiscriminator','VideoLocalDiscriminator', 
 												'VideoSNDiscriminator', 'VideoSNLocalDiscriminator',
 												'VideoDetDiscriminator','VideoSNDetDiscriminator', 
-												'VideoLSSNDetDiscriminator'])
+												'VideoLSSNDetDiscriminator','VideoVecSNDetDiscriminator','VideoPoolSNDetDiscriminator'])
 		inter_parser.add_argument('--video_disc_d_w', dest='video_disc_disc_weight', 
 										help='whether refine or not',
 										type=float,
@@ -480,14 +501,20 @@ class Options():
 										choices=['VideoDiscriminator', 'VideoLocalDiscriminator', 
 												'VideoSNDiscriminator', 'VideoSNLocalDiscriminator', 
 												'VideoDetDiscriminator','VideoSNDetDiscriminator',
-												'VideoLSSNDetDiscriminator'])  
+												'VideoLSSNDetDiscriminator', 'VideoLocalPatchSNDetDiscriminator',
+												'VideoVecSNDetDiscriminator', 'VideoPoolSNDetDiscriminator',
+												'VideoGlobalZeroSNDetDiscriminator', 'VideoGlobalResSNDetDiscriminator',
+												'VideoGlobalMaskSNDetDiscriminator', 'VideoGlobalCoordSNDetDiscriminator'])  
 		inter_parser.add_argument('--video_det_disc_model', dest='video_det_disc_model', 
 										default='VideoDiscriminator', 
 										help='refine model to use',
 										choices=['VideoDiscriminator','VideoLocalDiscriminator', 
 												'VideoSNDiscriminator', 'VideoSNLocalDiscriminator',
 												'VideoDetDiscriminator','VideoSNDetDiscriminator', 
-												'VideoLSSNDetDiscriminator'])
+												'VideoLSSNDetDiscriminator', 'VideoLocalPatchSNDetDiscriminator',
+												'VideoVecSNDetDiscriminator', 'VideoPoolSNDetDiscriminator',
+												'VideoGlobalZeroSNDetDiscriminator', 'VideoGlobalResSNDetDiscriminator',
+												'VideoGlobalMaskSNDetDiscriminator', 'VideoGlobalCoordSNDetDiscriminator'])
 		inter_parser.add_argument('--video_det_disc_d_w', dest='video_det_disc_disc_weight', 
 										help='whether refine or not',
 										type=float,

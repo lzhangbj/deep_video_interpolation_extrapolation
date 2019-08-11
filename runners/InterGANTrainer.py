@@ -20,7 +20,7 @@ from tensorboardX import SummaryWriter
 from torchvision.utils import make_grid, save_image
 # from utils import AverageMeter
 # from loss import CombinedLoss
-from losses import RGBLoss, PSNR, SSIM, IoU, GANLoss, VGGCosineLoss, KLDLoss, GANScalarLoss
+from losses import RGBLoss, PSNR, SSIM, IoU, GANLoss, VGGCosineLoss, KLDLoss, GANScalarLoss, TrackObjLoss
 import nets
 
 from data import get_dataset
@@ -49,12 +49,21 @@ class InterGANTrainer:
             self.set_net_grad(self.model.frame_disc_model, False)
         if self.args.video_disc and not self.args.train_video_disc: 
             self.set_net_grad(self.model.video_disc_model, False)
+        if self.args.frame_det_disc and not self.args.train_frame_det_disc: 
+            self.set_net_grad(self.model.frame_det_disc_model, False)
+        if self.args.video_det_disc and not self.args.train_video_det_disc: 
+            self.set_net_grad(self.model.video_det_disc_model, False)
+        if self.args.track_gen and self.args.split != 'train':
+            self.set_net_grad(self.model.track_gen_model, False)            
 
         params_cnt = count_parameters(self.model.coarse_model)
         args.logger.info("coarse params "+str(params_cnt))
         if self.args.frame_disc:
             params_cnt = count_parameters(self.model.frame_disc_model)
             args.logger.info("frame disc params "+str(params_cnt))
+        if self.args.track_gen:
+            params_cnt = count_parameters(self.model.track_gen_model)
+            args.logger.info("track gen params "+str(params_cnt))
         if self.args.video_disc:
             params_cnt = count_parameters(self.model.video_disc_model)
             args.logger.info("video disc params "+str(params_cnt))
@@ -78,6 +87,8 @@ class InterGANTrainer:
             self.RGBLoss = RGBLoss(args).cuda(args.rank)
             if self.args.vae:
                 self.KLDLoss = KLDLoss(args).cuda(args.rank)
+            if self.args.track_obj_loss:
+                self.TrackObjLoss = TrackObjLoss(args).cuda(args.rank)
             if self.args.frame_disc:
                 self.FrameDisc_DLoss = GANScalarLoss(weight=self.args.frame_disc_disc_weight).cuda(args.rank)
                 self.FrameDisc_GLoss = GANScalarLoss(weight=self.args.frame_disc_gen_weight).cuda(args.rank)
@@ -93,6 +104,8 @@ class InterGANTrainer:
             self.SegLoss = nn.CrossEntropyLoss().cuda(args.rank)
 
             self.coarse_opt = torch.optim.Adamax(list(self.model.module.coarse_model.parameters()), lr=args.coarse_learning_rate)
+            if self.args.track_gen:
+                self.track_gen_opt = torch.optim.Adamax(list(self.model.module.track_gen_model.parameters()), lr=args.coarse_learning_rate)
             if self.args.frame_disc:
                 self.frame_disc_opt = torch.optim.Adam(list(self.model.module.frame_disc_model.parameters()), lr=args.frame_disc_learning_rate)
             if self.args.video_disc:
@@ -122,7 +135,7 @@ class InterGANTrainer:
         torch.backends.cudnn.benchmark = True
         self.global_step = 0
         self.epoch=1
-        if args.resume or ( args.split != 'train' and not args.checkepoch_range) or self.args.load_coarse or self.args.load_refine:
+        if args.resume or ( args.split != 'train' and not args.checkepoch_range) :#or self.args.load_coarse or self.args.load_refine:
             self.load_checkpoint()
 
 
@@ -182,16 +195,19 @@ class InterGANTrainer:
         colors = [  (32,32,240),# red
                     (240,32,53),# blue
                     (74,240,32),# green
-                    (32,157,240) # orange
+                    (32,157,240), # orange
+                    (80,55,19),    # dark blue
+                    (157,161,156), # grey
                     ]
-        for ind, color in enumerate(colors):
-            bbox = bboxes[ind]
-            cv2.rectangle(img_np, (bbox[1], bbox[0]), (bbox[3], bbox[2]), color, 2)
+        for i in range(self.args.num_track_per_img):
+            bbox = bboxes[i]
+            color = colors[i%len(colors)]
+            cv2.rectangle(img_np, (int(bbox[1]), int(bbox[0])), (int(bbox[3]), int(bbox[2])), color, 2)
         return torch.tensor(img_np).permute(2,0,1).contiguous()
 
 
     def prepare_image_set(self, data, coarse_img, coarse_seg, real_frame=None, fake_frame=None, real_video=None, fake_video=None,
-                            real_frame_det=None, fake_frame_det=None, real_video_det=None, fake_video_det=None):
+                            real_frame_det=None, fake_frame_det=None, real_video_det=None, fake_video_det=None, gen_bbox=None):
         '''
             input unnormalized img and seg cpu 
         '''
@@ -221,15 +237,20 @@ class InterGANTrainer:
                     self.create_heatmap(fake_video)
                 ]
                 view_imgs += view_heatmaps
-            if 'Det' in self.args.frame_disc_model or 'Det' in self.args.video_disc_model or self.args.frame_det_disc or self.args.video_det_disc:
-                bboxes = data['bboxes'][0].cpu().numpy()
-                view_bboxes = [
-                    self.draw_bbox(view_gt_rgbs[0].cpu().detach(), bboxes[0]),
-                    self.draw_bbox(view_gt_rgbs[1].cpu().detach(), bboxes[1]),
-                    self.draw_bbox(view_gt_rgbs[2].cpu().detach(), bboxes[1]),
-                    self.draw_bbox(view_gt_rgbs[3].cpu().detach(), bboxes[2])
-                ]
-                view_imgs = view_imgs[:4] + view_bboxes + view_imgs[4:]
+        if 'Det' in self.args.frame_disc_model or 'Det' in self.args.video_disc_model \
+            or self.args.frame_det_disc or self.args.video_det_disc \
+            or self.args.track_obj_loss or gen_bbox is not None or self.args.track_gen:
+            bboxes = data['bboxes'][0].cpu().numpy()
+            view_bboxes = [
+                self.draw_bbox(view_gt_rgbs[0].cpu().detach(), bboxes[0, :, 1:]),
+                self.draw_bbox(view_gt_rgbs[1].cpu().detach(), bboxes[1, :, 1:]),
+                self.draw_bbox(view_gt_rgbs[3].cpu().detach(), bboxes[2, :, 1:])
+            ]
+            if gen_bbox is None:
+                view_bboxes.insert(2, self.draw_bbox(view_gt_rgbs[2].cpu().detach(), bboxes[1, :, 1:]))
+            else:
+                view_bboxes.insert(2, self.draw_bbox(view_gt_rgbs[2].cpu().detach(), gen_bbox))
+            view_imgs = view_imgs[:4] + view_bboxes + view_imgs[4:]
 
         view_imgs = [F.interpolate(img.unsqueeze(0), size=(128, 256), mode='bilinear', align_corners=True)[0] for img in view_imgs]
 
@@ -250,6 +271,8 @@ class InterGANTrainer:
         }
         if self.args.mode == 'xs2xs':
             d['coarse_ce_loss_record']=0
+        if self.args.track_obj_loss:
+            d['coarse_track_obj_loss_record']=0
         if self.args.vae:
             d['coarse_kld_loss_record']=0
         if self.args.frame_disc:
@@ -272,6 +295,8 @@ class InterGANTrainer:
             d['disc_video_det_fake_loss_record']=0
             d['disc_video_det_real_loss_record']=0
             d['disc_video_det_all_loss_record']=0
+        if self.args.track_gen:
+            d['coarse_loc_diff_loss_record'] = 0
         D.update(d)
 
         return D
@@ -279,6 +304,8 @@ class InterGANTrainer:
     def update_loss_record_dict(self, record_dict, loss_dict, batch_size):
         record_dict['data_cnt']+=batch_size
         loss_name_list = ['l1', 'gdl', 'ssim', 'vgg']
+        if self.args.track_obj_loss:
+            loss_name_list.append('track_obj')
         if self.args.mode == 'xs2xs':
             loss_name_list.append('ce')
         if self.args.vae:
@@ -291,13 +318,19 @@ class InterGANTrainer:
             loss_name_list.append('frame_det')
         if self.args.video_det_disc:
             loss_name_list.append('video_det')
+        if self.args.track_gen:
+            loss_name_list.append('loc_diff')
 
         for loss_name in loss_name_list:
             record_dict['coarse_{}_loss_record'.format(loss_name)] += \
                             batch_size*loss_dict['coarse_{}_loss'.format(loss_name)].item()
             record_dict['coarse_all_loss_record'] += batch_size*loss_dict['coarse_{}_loss'.format(loss_name)].item()
 
-        disc_name_list = ['frame', 'video']
+        disc_name_list = []
+        if self.args.frame_disc:
+            disc_name_list.append('frame')
+        if self.args.video_disc:
+            disc_name_list.append('video')
         if self.args.frame_det_disc:
             disc_name_list.append('frame_det')
         if self.args.video_det_disc:
@@ -348,18 +381,29 @@ class InterGANTrainer:
                 G_fake_frame_prob, G_fake_video_prob, \
                 D_fake_frame_det_prob, D_real_frame_det_prob, \
                 D_fake_video_det_prob, D_sync_fake_video_det_prob, D_real_video_det_prob, \
-                G_fake_frame_det_prob, G_fake_video_det_prob = self.model(x, seg, gt_x, gt_seg, bboxes=bboxes)
+                G_fake_frame_det_prob, G_fake_video_det_prob, \
+                gen_bbox, loc_diff_loss = self.model(x, seg, gt_x, gt_seg, bboxes=bboxes)
             else: # discarded
                 coarse_img, mu, logvar, \
                 D_fake_frame_prob, D_real_frame_prob, \
                 D_fake_video_prob, D_real_video_prob, \
-                G_fake_frame_prob, G_fake_video_prob = self.model(x, gt_x=gt_x, bboxes=bboxes)
+                G_fake_frame_prob, G_fake_video_prob, \
+                gen_bbox, loc_diff_loss = self.model(x, gt_x=gt_x, bboxes=bboxes)
 
             # 3. update outputs and store them
             prefix = 'coarse'
             loss_dict.update(self.RGBLoss(self.normalize(coarse_img), self.normalize(gt_x), False, prefix=prefix))
+            if self.args.track_obj_loss:
+                for_img = x[:,:3]
+                back_img = x[:, 3:6]
+                loss_dict[prefix+'_track_obj_loss'] = self.args.track_obj_weight*\
+                                                            self.TrackObjLoss(self.normalize(coarse_img), 
+                                                                                self.normalize(for_img),
+                                                                                self.normalize(back_img), bboxes, normed=False)
             if self.args.mode == 'xs2xs':
                 loss_dict[prefix+'_ce_loss'] = self.args.ce_weight*self.SegLoss(coarse_seg, torch.argmax(gt_seg, dim=1))  
+            if self.args.track_gen:
+                loss_dict[prefix+'_loc_diff_loss'] = self.args.loc_diff_weight*loc_diff_loss.mean()
             if self.args.vae:
                 loss_dict[prefix+'_kld_loss'] = self.KLDLoss(mu, logvar)
             if self.args.frame_disc:
@@ -398,12 +442,14 @@ class InterGANTrainer:
             self.sync(loss_dict)
             # backward pass
             self.coarse_opt.zero_grad()     if self.args.train_coarse  else None
+            self.track_gen_opt.zero_grad()  if self.args.train_coarse and self.args.track_gen else None
             self.frame_disc_opt.zero_grad() if self.args.train_frame_disc  else None
             self.video_disc_opt.zero_grad() if self.args.train_video_disc  else None
             self.frame_det_disc_opt.zero_grad() if self.args.train_frame_det_disc  else None
             self.video_det_disc_opt.zero_grad() if self.args.train_video_det_disc  else None
             loss_dict['loss_all'].backward()
             self.coarse_opt.step()  if self.args.train_coarse  else None
+            self.track_gen_opt.step()  if self.args.train_coarse  and self.args.track_gen else None
             self.frame_disc_opt.step()  if self.args.train_frame_disc and  self.global_step > GAN_TRAIN_STEP else None
             self.video_disc_opt.step()  if self.args.train_video_disc and  self.global_step > GAN_TRAIN_STEP else None
             self.frame_det_disc_opt.step()  if self.args.train_frame_det_disc and  self.global_step > GAN_TRAIN_STEP else None
@@ -437,6 +483,10 @@ class InterGANTrainer:
                         )
                     if self.args.mode == 'xs2xs':
                         log+= ' ce [{ce:.3f}]'.format(ce=step_loss_record_dict['coarse_ce_loss_record'])
+                    if self.args.track_obj_loss:
+                        log+= ' track_obj [{track_obj:.3f}]'.format(track_obj=step_loss_record_dict['coarse_track_obj_loss_record'])
+                    if self.args.track_gen:
+                        log+= ' loc_diff [{loc_diff:.3f}]'.format(loc_diff=step_loss_record_dict['coarse_loc_diff_loss_record'])
                     if self.args.vae:
                         log+= ' kld [{kld:.3f}]'.format(kld=step_loss_record_dict['coarse_kld_loss_record'])
                     if self.args.frame_disc:
@@ -447,6 +497,7 @@ class InterGANTrainer:
                         log+= ' frame det [{frame:.3f}]'.format(frame=step_loss_record_dict['coarse_frame_det_loss_record'])
                     if self.args.video_det_disc:
                         log+= ' video det [{video:.3f}]'.format(video=step_loss_record_dict['coarse_video_det_loss_record'])
+
                     log+= ' all [{all:.3f}]'.format(all=step_loss_record_dict['coarse_all_loss_record'])
                     if self.args.frame_disc:
                         log+= '\n\t\t\tframe disc real [{f_r:.3f}] fake [{f_f:.3f}]'.format(
@@ -482,17 +533,22 @@ class InterGANTrainer:
 
                 if self.step % 30 == 0: 
                     image_set = self.prepare_image_set(data, coarse_img[0].clamp_(-1,1).cpu(), coarse_seg[0].cpu(),
-                                                            D_real_frame_prob[0].clamp_(-1,1).cpu(), D_fake_frame_prob[0].clamp_(-1,1).cpu(),
-                                                            D_real_video_prob[0].clamp_(-1,1).cpu(), D_fake_video_prob[0].clamp_(-1,1).cpu(),
+                                                            D_real_frame_prob[0].clamp_(-1,1).cpu() if D_real_frame_prob is not None else None, 
+                                                            D_fake_frame_prob[0].clamp_(-1,1).cpu() if D_fake_frame_prob is not None else None,
+                                                            D_real_video_prob[0].clamp_(-1,1).cpu() if D_real_video_prob is not None else None, 
+                                                            D_fake_video_prob[0].clamp_(-1,1).cpu() if D_fake_video_prob is not None else None,
                                                             D_real_frame_det_prob[0].clamp_(-1,1).cpu() if D_real_frame_det_prob is not None else None, 
                                                             D_fake_frame_det_prob[0].clamp_(-1,1).cpu() if D_fake_frame_det_prob is not None else None,
                                                             D_real_video_det_prob[0].clamp_(-1,1).cpu() if D_real_video_det_prob is not None else None, 
-                                                            D_fake_video_det_prob[0].clamp_(-1,1).cpu() if D_fake_video_det_prob is not None else None
+                                                            D_fake_video_det_prob[0].clamp_(-1,1).cpu() if D_fake_video_det_prob is not None else None,
+                                                            gen_bbox=gen_bbox[0].cpu() if gen_bbox is not None else None
                                                         )
-                    img_name = 'image_{} frame real {:.3f} fake {:.3f} video real {:.3f} fake {:.3f} '.format(
-                                                self.global_step, 
-                                                D_real_frame_prob[0].mean().item(), D_fake_frame_prob[0].mean().item(), 
-                                                D_real_video_prob[0].mean().item(), D_fake_video_prob[0].mean().item())
+                    img_name = 'image_{} '.format(
+                                                self.global_step)
+                    if self.args.frame_disc:
+                        img_name+= ' frame real {:.3f} fake {:.3f}'.format(D_real_frame_prob[0].mean().item(), D_fake_frame_prob[0].mean().item())
+                    if self.args.video_disc:
+                        img_name+= ' video real {:.3f} fake {:.3f}'.format(D_real_video_prob[0].mean().item(), D_fake_video_prob[0].mean().item())
                     if self.args.frame_det_disc:
                         img_name+= ' frame det real {:.3f} fake {:.3f}'.format(D_real_frame_det_prob[0].mean().item(), D_fake_frame_det_prob[0].mean().item())
                     if self.args.video_det_disc:
@@ -521,6 +577,10 @@ class InterGANTrainer:
                 )
             if self.args.mode == 'xs2xs':
                 log+= ' ce [{ce:.3f}]'.format(ce=epoch_loss_record_dict['coarse_ce_loss_record'])
+            if self.args.track_obj_loss:
+                log+= ' track_obj [{track_obj:.3f}]'.format(track_obj=epoch_loss_record_dict['coarse_track_obj_loss_record'])
+            if self.args.track_gen:
+                log+= ' loc_diff [{loc_diff:.3f}]'.format(loc_diff=epoch_loss_record_dict['coarse_loc_diff_loss_record'])
             if self.args.vae:
                 log+= ' kld [{kld:.3f}]'.format(kld=epoch_loss_record_dict['coarse_kld_loss_record'])
             if self.args.frame_disc:
@@ -601,12 +661,12 @@ class InterGANTrainer:
                     G_fake_frame_prob, G_fake_video_prob, \
                     D_fake_frame_det_prob, D_real_frame_det_prob, \
                     D_fake_video_det_prob, D_real_video_det_prob, \
-                    G_fake_frame_det_prob, G_fake_video_det_prob = self.model(x, seg, gt_x, gt_seg, bboxes=bboxes)
+                    G_fake_frame_det_prob, G_fake_video_det_prob, gen_bbox, loc_diff_loss = self.model(x, seg, gt_x, gt_seg, bboxes=bboxes)
                 else: # discarded
                     coarse_img, mu, logvar, \
                     D_fake_frame_prob, D_real_frame_prob, \
                     D_fake_video_prob, D_real_video_prob, \
-                    G_fake_frame_prob, G_fake_video_prob = self.model(x, gt_x=gt_x, bboxes=bboxes)
+                    G_fake_frame_prob, G_fake_video_prob, gen_bbox, loc_diff_loss = self.model(x, gt_x=gt_x, bboxes=bboxes)
 
                 # 3. update outputs and store them
                 # rgb criteria
@@ -641,12 +701,12 @@ class InterGANTrainer:
                         )
                         comp_time = 0
                         load_time = 0
-                    if self.step % 3 == 0: 
+                    if self.step % 1 == 0: 
                         # image_set = self.prepare_image_set(data, coarse_img[0].clamp_(-1,1).cpu(), coarse_seg[0].cpu(),
                         #                                     D_real_frame_prob[0].clamp_(-1,1).cpu(), D_fake_frame_prob[0].clamp_(-1,1).cpu(),
                         #                                     D_real_video_prob[0].clamp_(-1,1).cpu(), D_fake_video_prob[0].clamp_(-1,1).cpu()
                         #                                 )
-                        image_set = self.prepare_image_set(data, coarse_img[0].clamp_(-1,1).cpu(), coarse_seg[0].cpu())
+                        image_set = self.prepare_image_set(data, coarse_img[0].clamp_(-1,1).cpu(), coarse_seg[0].cpu(), gen_bbox=gen_bbox[0].cpu()if gen_bbox is not None else None)
                         img_name = 'e{}_img_{}'.format(
                                                 self.epoch,
                                                 self.step)
@@ -656,11 +716,11 @@ class InterGANTrainer:
             log_main = '\n######################### Epoch [{epoch:d}] Evaluation Results #########################'.format(epoch=self.epoch)
 
             log = '\n\tcoarse l1 [{l1:.3f}] vgg [{vgg:.3f}] psnr [{psnr:.3f}] ssim [{ssim:.3f}] iou [{iou:.3f}]'.format(
-                    l1=val_criteria['l1'].avg,
-                    vgg=val_criteria['vgg'].avg,
+                    l1  =val_criteria['l1'].avg,
+                    vgg =val_criteria['vgg'].avg,
                     psnr=val_criteria['psnr'].avg,
                     ssim=val_criteria['ssim'].avg,
-                    iou=val_criteria['iou'].avg
+                    iou =val_criteria['iou'].avg
                 )
             log_main+=log
             log_main += '\n#####################################################################################\n'
@@ -670,7 +730,7 @@ class InterGANTrainer:
             tfb_info = {key:value.avg for key,value in val_criteria.items()}
             self.writer.add_scalars('val/score', tfb_info, self.epoch)
 
-
+    
     def cycgen(self):
         assert self.args.rank == 0 # only allow single worker
         with open('/data/linz/proj/Dataset/Cityscape/load_files/root_clip.pkl', 'rb') as f:
@@ -856,11 +916,14 @@ class InterGANTrainer:
         save_dict = {
             'session': self.args.session,
             'epoch': self.epoch + 1,
-            'coarse_model': self.model.module.coarse_model.cpu().state_dict(),
+            'coarse_model': self.model.module.coarse_model.state_dict(),
             'coarse_opt': self.coarse_opt.state_dict(),
         }
+        if self.args.track_gen:
+            save_dict['track_gen_model'] = self.model.module.track_gen_model.state_dict()
+            save_dict['track_gen_opt'] = self.track_gen_opt.state_dict()
         if self.args.frame_disc:
-            save_dict['frame_disc_model'] = self.model.module.frame_disc_mode.state_dict()
+            save_dict['frame_disc_model'] = self.model.module.frame_disc_model.state_dict()
             save_dict['frame_disc_opt'] = self.frame_disc_opt.state_dict()
         if self.args.video_disc:
             save_dict['video_disc_model'] = self.model.module.video_disc_model.state_dict()
@@ -894,6 +957,13 @@ class InterGANTrainer:
                 new_ckpt[key] = item
             coarse_model_dict.update(new_ckpt)
             self.model.module.coarse_model.load_state_dict(coarse_model_dict)
+            if self.args.track_gen:
+                new_ckpt = OrderedDict()
+                track_gen_model_dict = self.model.module.track_gen_model.state_dict()
+                for key,item in ckpt['track_gen_model'].items():
+                    new_ckpt[key] = item
+                track_gen_model_dict.update(new_ckpt)
+                self.model.module.track_gen_model.load_state_dict(track_gen_model_dict)
 
         if self.args.load_frame_disc:
             new_ckpt = OrderedDict()
@@ -941,6 +1011,12 @@ class InterGANTrainer:
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor):
                             state[k] = v.cuda(self.args.rank)
+                if self.args.track_gen:
+                    self.track_gen_opt.load_state_dict(ckpt['track_gen_opt'])
+                    for state in self.track_gen_opt.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.cuda(self.args.rank)
             # load frame opt
             if self.args.train_frame_disc and self.args.load_frame_disc:
                 assert self.args.frame_disc

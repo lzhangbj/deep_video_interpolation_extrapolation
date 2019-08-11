@@ -138,12 +138,13 @@ class FrameSNDiscriminator(nn.Module):
 				nn.LeakyReLU(0.2, inplace=True),
 				ResnetSNBlock(128, 128, 3),
 				# downsize 4 192*8*8
-				SpectralNorm(nn.Conv2d(128, 192, 3, 2, 1)),
-				nn.LeakyReLU(0.2, inplace=True),
-				ResnetSNBlock(192, 192, 3),
+				# SpectralNorm(nn.Conv2d(128, 192, 3, 2, 1)),
+				# nn.LeakyReLU(0.2, inplace=True),
+				# ResnetSNBlock(192, 192, 3),
 				# out layer
-				SpectralNorm(nn.Conv2d(192, 192, 3, 1, 1)),
-				nn.AvgPool2d(8)
+				# SpectralNorm(nn.Conv2d(192, 192, 3, 1, 1)),
+				SpectralNorm(nn.Conv2d(128, 128, 3, 1, 1)),
+				nn.AvgPool2d(16)
 			)
 
 	def forward(self, x, seg, bboxes=None):
@@ -151,7 +152,7 @@ class FrameSNDiscriminator(nn.Module):
 		if self.args.seg_disc:
 			input = torch.cat([x, seg], dim=1)
 		output = self.layer(input)
-		output = output.view(-1, 192).mean(dim=1)
+		output = output.view(-1, 128).mean(dim=1)
 		return output
 
 class FrameSNLocalDiscriminator(nn.Module):
